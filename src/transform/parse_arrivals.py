@@ -1,6 +1,8 @@
 import xml.etree.ElementTree as ET
 import pandas as pd
 from pathlib import Path
+from datetime import datetime
+import shutil
 
 def parse_arrivals(xml_file):
     tree = ET.parse(xml_file)
@@ -9,6 +11,11 @@ def parse_arrivals(xml_file):
     etas = root.findall("eta")
 
     records = []
+
+    filename = Path(xml_file).stem
+    parts = filename.split("_")
+
+    collection_timestamp = pd.to_datetime("_".join(parts[:2]),format="%Y%m%d_%H%M%S")
 
     for eta in etas:
         station_id = eta.find("staId").text
@@ -39,6 +46,7 @@ def parse_arrivals(xml_file):
         ).total_seconds() / 60
 
         records.append({
+            "collection_timestamp": collection_timestamp,
             "station_id": station_id,
             "station": station,
             "stop_id": stop_id,
@@ -52,28 +60,38 @@ def parse_arrivals(xml_file):
             "latitude": latitude,
             "longitude": longitude,
             "heading": heading,
-            "wait_time": wait_time
+            "wait_time": wait_time,
+            "source_file": Path(xml_file).name
         })
 
     return pd.DataFrame(records)
 
 def parse_all_arrivals(folder):
     all_dfs = []
+    processed_files = []
 
-    for xml_file in Path(folder).glob("*.xml"):
+    xml_files = list(Path(folder).glob("*.xml"))
+
+    print(f"Found {len(xml_files)} XML files to parse.")
+
+    for xml_file in xml_files:
         df = parse_arrivals(xml_file)
         all_dfs.append(df)
+        processed_files.append(xml_file)
 
-    return pd.concat(all_dfs, ignore_index=True)
+        print(f"Parsed {xml_file.name}: {len(df)} arrivals")
+
+    combined_df = pd.concat(all_dfs, ignore_index=True)
+
+    print(
+        f"Finished parsing {len(xml_files)} files. "
+        f"Total arrivals: {len(combined_df)}"
+    )
+
+    return combined_df, processed_files
 
 
+if __name__ == "__main__":
+    df = parse_all_arrivals("data/raw/arrivals")
 
-xml_file = "data/raw/arrivals/20260608_183325.xml"
-
-df = parse_all_arrivals("data/raw/arrivals")
-
-
-df.to_csv(
-    "data/processed/arrivals/all_arrivals_20260608_183325.csv",
-    index=False
-)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
