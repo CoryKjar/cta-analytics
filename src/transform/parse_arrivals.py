@@ -64,6 +64,7 @@ def parse_arrivals(xml_file):
             "source_file": Path(xml_file).name
         })
 
+
     return pd.DataFrame(records)
 
 def parse_all_arrivals(folder):
