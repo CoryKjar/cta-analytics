@@ -23,6 +23,9 @@ def fetch_arrivals():
     output_folder = Path("data/raw/arrivals")
     output_folder.mkdir(parents=True, exist_ok=True)
 
+    successful = 0
+    failed = 0
+
     for station_name, map_id in STATIONS.items():
         try:
             params = {
@@ -48,10 +51,12 @@ def fetch_arrivals():
                 f.write(response.text)
 
             logger.info(f"Saved {station_name}")
+            successful += 1
 
         except Exception as e:
             logger.error(f"Failed to fetch arrivals for {station_name}: {e}")
-
+            failed += 1
+    logger.info(f"Fetch arrivals completed: {successful} successful, {failed} failed")
 
 if __name__ == "__main__":
     fetch_arrivals()
