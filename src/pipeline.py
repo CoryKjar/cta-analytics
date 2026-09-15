@@ -8,10 +8,6 @@ def main():
 
     df, processed_files = parse_all_arrivals("data/raw/arrivals")
 
-    if df.empty:
-        print("No arrivals found. Files will not be archived.")
-        return
-
     load_arrivals_data(df)
 
     archive_files(processed_files)
