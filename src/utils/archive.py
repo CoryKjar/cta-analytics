@@ -1,12 +1,12 @@
 from pathlib import Path
-import shutil
 
-
-def archive_files(files, archive_folder="data/raw/arrivals/archive"):
-    archive_path = Path(archive_folder)
-    archive_path.mkdir(parents=True, exist_ok=True)
+def archive_files(files):
+    deleted = 0
 
     for file in files:
-        shutil.move(str(file), archive_path / file.name)
+        file = Path(file)
+        if file.exists():
+            file.unlink()
+            deleted += 1
 
-    print(f"Archived {len(files)} files.")
+    print(f"Removed {deleted} local staging files.")

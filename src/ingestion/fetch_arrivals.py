@@ -7,6 +7,8 @@ from datetime import datetime
 
 from dotenv import load_dotenv
 
+from src.storage.object_storage import upload_file
+
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 from config.stations import STATIONS
 
@@ -49,6 +51,16 @@ def fetch_arrivals():
 
             with open(filename, "w", encoding="utf-8") as f:
                 f.write(response.text)
+
+            object_key = (
+                f"raw/"
+                f"{timestamp[:4]}/"
+                f"{timestamp[4:6]}/"
+                f"{timestamp[6:8]}/"
+                f"{filename.name}"
+            )
+
+            upload_file(filename, object_key)
 
             logger.info(f"Saved {station_name}")
             successful += 1
