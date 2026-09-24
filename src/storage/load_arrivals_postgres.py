@@ -25,7 +25,7 @@ def load_arrivals_data(df):
             # ---------------------------------------------------------
             cursor.execute("""
                 SELECT route_id, route_name
-                FROM routes_v2;
+                FROM routes;
             """)
 
             route_map = {
@@ -38,7 +38,7 @@ def load_arrivals_data(df):
             # ---------------------------------------------------------
             cursor.execute("""
                 SELECT destination_id, destination_name
-                FROM destinations_v2;
+                FROM destinations;
             """)
 
             destination_map = {
@@ -99,7 +99,7 @@ def load_arrivals_data(df):
 
             cursor.executemany(
                 """
-                INSERT INTO ingestion_files_v2 (
+                INSERT INTO ingestion_files (
                     source_file,
                     collection_timestamp,
                     station_id
@@ -122,7 +122,7 @@ def load_arrivals_data(df):
             cursor.execute(
                 """
                 SELECT file_id, source_file
-                FROM ingestion_files_v2
+                FROM ingestion_files
                 WHERE source_file = ANY(%s);
                 """,
                 (source_file_names,),
@@ -213,7 +213,7 @@ def load_arrivals_data(df):
             # 7. Insert arrivals
             # ---------------------------------------------------------
             query = """
-                INSERT INTO arrivals_v2 (
+                INSERT INTO arrivals (
                     collection_timestamp,
                     station_id,
                     stop_id,
