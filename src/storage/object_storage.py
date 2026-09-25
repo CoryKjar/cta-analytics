@@ -13,12 +13,6 @@ def get_bucket_client():
     secret_key = os.getenv("SECRET_ACCESS_KEY")
     region = os.getenv("REGION", "auto")
 
-    print("Bucket configuration:")
-    print(f"  ENDPOINT: {endpoint}")
-    print(f"  ACCESS_KEY_ID present: {bool(access_key)}")
-    print(f"  SECRET_ACCESS_KEY present: {bool(secret_key)}")
-    print(f"  REGION: {region}")
-
     if not all([endpoint, access_key, secret_key]):
         raise ValueError(
             "Railway Bucket credentials are not configured."
@@ -42,7 +36,7 @@ def upload_file(local_path, object_key):
     load_dotenv()
 
     bucket = os.getenv("BUCKET")
-    print(f"  BUCKET: {bucket}")
+
     if not bucket:
         raise ValueError("BUCKET is not configured.")
 
