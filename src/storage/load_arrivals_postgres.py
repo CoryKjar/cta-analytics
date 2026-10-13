@@ -47,7 +47,7 @@ def load_arrivals_data(df):
             }
 
             # ---------------------------------------------------------
-            # 3. Validate that all incoming dimension values exist
+            # 3. Validate routes and automatically add destinations
             # ---------------------------------------------------------
             incoming_routes = set(df["route"].dropna().unique())
             missing_routes = incoming_routes - set(route_map)
@@ -57,18 +57,70 @@ def load_arrivals_data(df):
                     f"Unknown routes found in incoming data: {missing_routes}"
                 )
 
-            incoming_destinations = set(
-                df["destination"].dropna().unique()
-            )
+            # Normalize incoming destination strings.
+            incoming_destinations = {
+                str(value).strip()
+                for value in df["destination"].dropna().unique()
+                if str(value).strip()
+            }
+
+            # Lock the dimension while assigning IDs.
+            cursor.execute("""
+                LOCK TABLE destinations IN EXCLUSIVE MODE;
+            """)
+
+            # Refresh the mapping after acquiring the lock.
+            cursor.execute("""
+                SELECT destination_id, destination_name
+                FROM destinations;
+            """)
+
+            destination_map = {
+                name: destination_id
+                for destination_id, name in cursor.fetchall()
+            }
+
             missing_destinations = (
                 incoming_destinations - set(destination_map)
             )
 
             if missing_destinations:
-                raise ValueError(
-                    "Unknown destinations found in incoming data: "
-                    f"{missing_destinations}"
-                )
+                cursor.execute("""
+                    SELECT COALESCE(MAX(destination_id), 0)
+                    FROM destinations;
+                """)
+
+                max_id = cursor.fetchone()[0]
+
+                for offset, name in enumerate(
+                    sorted(missing_destinations), start=1
+                ):
+                    new_id = max_id + offset
+
+                    cursor.execute("""
+                        INSERT INTO destinations (
+                            destination_id,
+                            destination_name
+                        )
+                        VALUES (%s, %s);
+                    """, (new_id, name))
+
+                    print(
+                        f"Added destination: {name} "
+                        f"(ID: {new_id})"
+                    )
+
+                # Refresh the mapping with the new destinations.
+                cursor.execute("""
+                    SELECT destination_id, destination_name
+                    FROM destinations;
+                """)
+
+                destination_map = {
+                    name: destination_id
+                    for destination_id, name in cursor.fetchall()
+                }
+
 
             # ---------------------------------------------------------
             # 4. Register source files
