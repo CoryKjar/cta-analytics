@@ -1,6 +1,7 @@
 from datetime import datetime
 from pathlib import Path
 
+import os
 import pandas as pd
 
 from src.ingestion.fetch_arrivals import fetch_arrivals
@@ -22,6 +23,17 @@ def _timestamp_from_path(path):
 
 
 def main():
+    # Optional bounded recovery pass. Enable with SELF_HEAL_ENABLED=true.
+    # Run this periodically (for example daily), not on every high-frequency poll,
+    # because it inventories the historical Bucket.
+    if os.getenv("SELF_HEAL_ENABLED", "false").strip().lower() in {"1", "true", "yes"}:
+        from src.storage.self_heal import run_self_heal
+        try:
+            run_self_heal()
+        except Exception as exc:
+            # Recovery must not prevent the normal current-cycle collection.
+            print(f"WARNING: self-heal pass failed; continuing normal collection: {exc}")
+
     fetched_files = fetch_arrivals()
     if not fetched_files:
         print("No station snapshots were uploaded; nothing to parse.")
