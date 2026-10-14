@@ -3,3 +3,4 @@ pandas==3.0.6
 psycopg==3.3.5
 python-dotenv==1.2.3
 Requests==2.34.2
+streamlit>=1.40,<2
