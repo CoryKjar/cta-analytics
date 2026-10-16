@@ -11,6 +11,8 @@ from dotenv import load_dotenv
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from dashboard.manifest_status import build_manifest_status_view  # noqa: E402
+from dashboard.manifest_history import fetch_manifest_history  # noqa: E402
 from src.monitoring.health_check import collect_health  # noqa: E402
 
 load_dotenv()
@@ -52,12 +54,28 @@ c2.metric("Snapshot age", age_text)
 c3.metric("Files updated in last 15 min", f"{health['recent_updates']:,}")
 c4.metric("Row-count mismatches", f"{health['mismatch_count']:,}")
 
-st.subheader("Manifest status")
-status_frame = pd.DataFrame(
-    [{"Status": status, "Files": count} for status, count in sorted(statuses.items())]
+st.subheader("Manifest snapshot files by collection hour")
+st.caption(
+    "Counts manifest files by source collection timestamp in America/Chicago, "
+    "not collection runs, API requests, or arrival records."
 )
-if status_frame.empty:
+try:
+    history_frame = fetch_manifest_history()
+except Exception as exc:
+    st.warning(f"Unable to read collection history: {exc}")
+else:
+    if history_frame.empty or history_frame["Manifest files"].sum() == 0:
+        st.info("No manifest snapshot files found in the last 24 hours.")
+    else:
+        st.bar_chart(history_frame)
+
+st.subheader("Manifest status")
+processed_count, status_frame, manifest_state = build_manifest_status_view(statuses)
+st.metric("Processed manifest files", f"{processed_count:,}")
+if manifest_state == "empty":
     st.info("No ingestion manifest rows found.")
+elif manifest_state == "all_processed":
+    st.success("All manifest files are marked processed.")
 else:
     st.bar_chart(status_frame.set_index("Status"))
 
@@ -69,6 +87,8 @@ if rows:
         columns=["source_file", "status", "attempts", "last_error", "updated_at"],
     )
     st.dataframe(df, use_container_width=True, hide_index=True)
+elif manifest_state == "empty":
+    st.info("No manifest files to review.")
 else:
     st.success("All manifest files are marked processed.")
 
