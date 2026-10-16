@@ -2,6 +2,7 @@
 import os
 import sys
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import streamlit as st
@@ -43,16 +44,23 @@ else:
     st.success("No monitored issues detected")
 
 latest = health["latest_snapshot"]
-latest_text = latest.isoformat() if latest else "No processed snapshots"
+latest_text = (
+    latest.astimezone(ZoneInfo("America/Chicago")).isoformat()
+    if latest else "No processed snapshots"
+)
 age = health["age_minutes"]
 age_text = f"{age:.1f} min" if age is not None else "N/A"
 statuses = health["status_counts"]
 
 c1, c2, c3, c4 = st.columns(4)
-c1.metric("Latest processed snapshot (UTC)", latest_text)
+c1.metric("Latest processed snapshot (America/Chicago)", latest_text)
 c2.metric("Snapshot age", age_text)
-c3.metric("Files updated in last 15 min", f"{health['recent_updates']:,}")
+c3.metric("Manifest records updated in last 15 min", f"{health['recent_updates']:,}")
 c4.metric("Row-count mismatches", f"{health['mismatch_count']:,}")
+st.caption(
+    "Recent updates count manifest-record updates, not confirmed collector runs; "
+    "recovery or reconciliation can also update records."
+)
 
 st.subheader("Manifest snapshot files by collection hour")
 st.caption(

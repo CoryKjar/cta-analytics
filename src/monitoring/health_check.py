@@ -11,6 +11,7 @@ import os
 import smtplib
 from email.message import EmailMessage
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 import psycopg
 from dotenv import load_dotenv
@@ -82,8 +83,13 @@ def collect_health():
     now = datetime.now(timezone.utc)
     age_minutes = None
     if latest is not None:
+        # The SQL expression returns a UTC-aware value when the source column is
+        # a naive Chicago timestamp, but can return a naive Chicago wall time if
+        # the source column is timestamptz. Normalize both cases to UTC before
+        # calculating age or exposing the timestamp to the dashboard.
         if latest.tzinfo is None:
-            latest = latest.replace(tzinfo=timezone.utc)
+            latest = latest.replace(tzinfo=ZoneInfo("America/Chicago"))
+        latest = latest.astimezone(timezone.utc)
         age_minutes = max(0.0, (now - latest).total_seconds() / 60.0)
 
     issues = {}
@@ -100,6 +106,26 @@ def collect_health():
         issues["processing_files"] = (
             f"{status_counts['processing']} file(s) have status processing."
         )
+
+    # Keep known operational states on their existing alert paths, but flag any
+    # new/unrecognized status so it cannot silently appear only in the dashboard.
+    known_statuses = {"processed", "failed", "processing"}
+    unexpected_statuses = {
+        status: count
+        for status, count in status_counts.items()
+        if status not in known_statuses
+    }
+    if unexpected_statuses:
+        status_summary = ", ".join(
+            f"{status!r}: {count}"
+            for status, count in sorted(
+                unexpected_statuses.items(), key=lambda item: str(item[0])
+            )
+        )
+        issues["unexpected_statuses"] = (
+            f"Unrecognized ingestion status(es) detected: {status_summary}."
+        )
+
     if retry_rows:
         issues["retry_cap"] = (
             f"{len(retry_rows)} non-processed file(s) are at or above "
