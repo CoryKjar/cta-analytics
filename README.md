@@ -60,6 +60,24 @@ python -B -m unittest discover -s tests -v
 
 Tests use mocked database/bucket clients and cover active parsing, train identity, loading, source conflicts, audit protection, health checks and logging. They do not execute live collection or recovery.
 
+## Logging
+
+Collection, loading, local cleanup, recovery and scheduled health checks use the same UTC timestamped logger. INFO/WARNING events go to stdout and ERROR events go to stderr, so Railway can distinguish normal activity from failures. Local output also goes to `logs/pipeline.log`.
+
+The local file rotates at 5 MB and retains three backups (`pipeline.log.1` through `.3`), approximately 20 MB total. Components share a file handler within a process; rotation is not coordinated between separate processes writing the same local path. Railway services have separate container filesystems, and local files are not durable unless storage is mounted. Railway console-log retention is separate.
+
+Filter service logs using these event names:
+
+- `event=file_parse_failed` or `event=pipeline_failed`: collector failures.
+- `event=arrivals_loaded`: committed prediction rows and file count.
+- `event=recovery_file_failed`: filename, failed stage and safe error type.
+- `event=recovery_file_completed`: successfully loaded or empty snapshot.
+- `event=recovery_completed`: recovery counts, failures, repaired row counts and retry-cap skips; ERROR if failures or exhausted retries remain.
+- `event=health_check_completed` or `event=health_issue`: health summary and detected issue types.
+- `event=health_email_sent`: alert or recovery email accepted by the configured SMTP transport; not proof of inbox delivery.
+
+Dry runs emit `event=recovery_dry_run_completed` without writes. Operational failures log exception types rather than raw exception messages, signed URLs, connection strings or tracebacks. The manifest still stores the latest file outcome, not a complete attempt history. Logging does not change recovery selection, retry policy, health thresholds or email deduplication.
+
 ## Recovery
 
 Start with `SELF_HEAL_DRY_RUN=true` to inspect candidates without writes. Before a write-enabled pilot, set it to `false`, set `SELF_HEAL_MAX_FILES=25` and `SELF_HEAL_BATCH_SIZE=25`, then run the recovery worker. Keep `SELF_HEAL_MAX_ATTEMPTS` finite so invalid files do not retry forever.

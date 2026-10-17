@@ -55,10 +55,13 @@ from src.storage.load_arrivals_postgres import load_arrivals_data, register_file
 from src.transform.parse_arrivals import parse_arrivals
 
 from src.utils.archive import archive_files
+from src.utils.logger import get_logger
+from src.storage.object_storage import storage_error_details
 
 
 
 load_dotenv()
+logger = get_logger(__name__)
 
 PREFIX = "raw/"
 
@@ -253,10 +256,18 @@ def _repair_counts(database_url):
 
 
 def run_self_heal():
+    logger.info("event=recovery_started dry_run=%s max_files=%s batch_size=%s", DRY_RUN, MAX_FILES, BATCH_SIZE)
+    try:
+        return _run_self_heal()
+    except Exception as exc:
+        logger.error("event=recovery_failed error_type=%s", type(exc).__name__)
+        raise
 
+
+def _run_self_heal():
     client, bucket, database_url = _clients()
 
-    print("Self-heal: inventorying Bucket XML objects...", flush=True)
+    logger.info("event=recovery_inventory_started")
 
     objects = _inventory(client, bucket)
 
@@ -288,13 +299,10 @@ def run_self_heal():
 
 
 
-    print(f"Bucket XML objects: {len(objects):,}", flush=True)
-
-    print(f"Manifest rows: {len(manifest):,}", flush=True)
-
-    print(f"Processed row-count mismatches found: {len(count_mismatches):,}", flush=True)
-
-    print(f"Recovery candidates (bounded to {MAX_FILES}): {len(candidates):,}", flush=True)
+    logger.info(
+        "event=recovery_inventory_completed bucket_objects=%s manifest_files=%s row_count_mismatches=%s candidates=%s",
+        len(objects), len(manifest), len(count_mismatches), len(candidates),
+    )
 
 
 
@@ -302,9 +310,9 @@ def run_self_heal():
 
         for name, _, reason in candidates[:50]:
 
-            print(f"DRY RUN candidate [{reason}]: {name}")
+            logger.info("event=recovery_candidate file=%r reason=%r", name, reason)
 
-        print("Dry run enabled; no data changed.")
+        logger.info("event=recovery_dry_run_completed candidates=%s", len(candidates))
 
         return {"candidates": len(candidates), "recovered": 0, "dry_run": True}
 
@@ -314,7 +322,7 @@ def run_self_heal():
 
     if repaired:
 
-        print(f"Repaired {len(repaired):,} derived row_count values.", flush=True)
+        logger.info("event=recovery_row_counts_repaired files=%s", len(repaired))
 
 
 
@@ -348,7 +356,12 @@ def run_self_heal():
 
                 stats["download_failures"] += 1
 
-                failures.append((name, key, f"download: {exc}"))
+                code, status = storage_error_details(exc)
+                logger.error(
+                    "event=recovery_file_failed stage=download file=%r error_type=%s storage_error_code=%s storage_http_status=%s",
+                    name, type(exc).__name__, code, status,
+                )
+                failures.append((name, key, f"download: {type(exc).__name__}"))
 
                 continue
 
@@ -376,7 +389,8 @@ def run_self_heal():
 
                 stats["parse_failures"] += 1
 
-                failures.append((name, key, f"parse: {exc}"))
+                logger.error("event=recovery_file_failed stage=parse file=%r error_type=%s", name, type(exc).__name__)
+                failures.append((name, key, f"parse: {type(exc).__name__}"))
 
 
 
@@ -397,15 +411,18 @@ def run_self_heal():
                 load_arrivals_data(combined)
                 stats["recovered_with_arrivals"] += len(frame_names)
                 good_names.update(frame_names)
+                for name in sorted(frame_names):
+                    logger.info("event=recovery_file_completed file=%r outcome=loaded", name)
             except Exception as exc:
                 stats["load_failures"] += len(frame_names)
-                print(
-                    f"LOAD ERROR in batch {start // BATCH_SIZE + 1}: {exc}",
-                    flush=True,
+                logger.error(
+                    "event=recovery_batch_failed stage=load batch=%s files=%s error_type=%s",
+                    start // BATCH_SIZE + 1, len(frame_names), type(exc).__name__,
                 )
 
                 failure_records = []
                 for name in sorted(frame_names):
+                    logger.error("event=recovery_file_failed stage=load file=%r error_type=%s", name, type(exc).__name__)
                     try:
                         failure_records.append({
                             "source_file": name,
@@ -413,22 +430,16 @@ def run_self_heal():
                             "station_id": None,
                             "status": "failed",
                             "row_count": 0,
-                            "last_error": f"load: {exc}"[:4000],
+                            "last_error": f"load: {type(exc).__name__}",
                         })
                     except ValueError:
-                        print(
-                            f"Could not parse timestamp from failed file: {name}",
-                            flush=True,
-                        )
+                        logger.error("event=recovery_failure_record_skipped stage=load file=%r reason=invalid_filename", name)
 
                 if failure_records:
                     try:
                         register_file_results(failure_records)
                     except Exception as record_exc:
-                        print(
-                            f"Could not record load failures: {record_exc}",
-                            flush=True,
-                        )
+                        logger.error("event=recovery_failure_registration_failed stage=load error_type=%s", type(record_exc).__name__)
 
         # Register empty files separately, so their failure cannot affect
         # files successfully loaded by load_arrivals_data().
@@ -438,16 +449,18 @@ def run_self_heal():
                 register_file_results(empty)
                 stats["recovered_empty"] += len(empty)
                 good_names.update(empty_names)
+                for name in sorted(empty_names):
+                    logger.info("event=recovery_file_completed file=%r outcome=empty", name)
             except Exception as exc:
                 stats["load_failures"] += len(empty_names)
-                print(
-                    f"EMPTY-FILE REGISTRATION ERROR in batch "
-                    f"{start // BATCH_SIZE + 1}: {exc}",
-                    flush=True,
+                logger.error(
+                    "event=recovery_batch_failed stage=empty_registration batch=%s files=%s error_type=%s",
+                    start // BATCH_SIZE + 1, len(empty_names), type(exc).__name__,
                 )
 
                 failure_records = []
                 for name in sorted(empty_names):
+                    logger.error("event=recovery_file_failed stage=empty_registration file=%r error_type=%s", name, type(exc).__name__)
                     try:
                         failure_records.append({
                             "source_file": name,
@@ -455,22 +468,16 @@ def run_self_heal():
                             "station_id": None,
                             "status": "failed",
                             "row_count": 0,
-                            "last_error": f"empty-file registration: {exc}"[:4000],
+                            "last_error": f"empty-file registration: {type(exc).__name__}",
                         })
                     except ValueError:
-                        print(
-                            f"Could not parse timestamp from failed file: {name}",
-                            flush=True,
-                        )
+                        logger.error("event=recovery_failure_record_skipped stage=empty_registration file=%r reason=invalid_filename", name)
 
                 if failure_records:
                     try:
                         register_file_results(failure_records)
                     except Exception as record_exc:
-                        print(
-                            f"Could not record empty-file failures: {record_exc}",
-                            flush=True,
-                        )
+                        logger.error("event=recovery_failure_registration_failed stage=empty_registration error_type=%s", type(record_exc).__name__)
 
         # Record download and parse failures independently.
         if failures:
@@ -479,10 +486,7 @@ def run_self_heal():
                 try:
                     ts = _timestamp(name)
                 except ValueError:
-                    print(
-                        f"Could not parse timestamp from failed file: {name}",
-                        flush=True,
-                    )
+                    logger.error("event=recovery_failure_record_skipped file=%r reason=invalid_filename", name)
                     continue
 
                 failure_records.append({
@@ -498,7 +502,7 @@ def run_self_heal():
                 try:
                     register_file_results(failure_records)
                 except Exception as exc:
-                    print(f"Could not record failures: {exc}", flush=True)
+                    logger.error("event=recovery_failure_registration_failed stage=parse_or_download error_type=%s", type(exc).__name__)
 
         # Archive only files successfully loaded or registered as empty.
         good_paths = [
@@ -508,18 +512,15 @@ def run_self_heal():
         if good_paths:
             archive_files(good_paths)
 
-    print("\nSELF-HEAL SUMMARY")
-
-
-    for key, value in stats.items():
-
-        print(f"{key}: {value:,}")
-
-    print(f"Row-count values repaired: {len(repaired):,}")
-
-    print(f"Unprocessed candidates skipped due to attempt cap: "
-
-          f"{sum(1 for n, r in manifest.items() if r['status'] != 'processed' and r['attempts'] >= MAX_ATTEMPTS):,}")
+    skipped = sum(1 for row in manifest.values() if row["status"] != "processed" and row["attempts"] >= MAX_ATTEMPTS)
+    if skipped:
+        logger.warning("event=recovery_retry_cap_reached files=%s max_attempts=%s", skipped, MAX_ATTEMPTS)
+    log = logger.error if any(stats[key] for key in ("parse_failures", "download_failures", "load_failures")) or skipped else logger.info
+    log(
+        "event=recovery_completed candidates=%s recovered_with_arrivals=%s recovered_empty=%s parse_failures=%s download_failures=%s load_failures=%s row_counts_repaired=%s retry_cap_skipped=%s",
+        len(candidates), stats["recovered_with_arrivals"], stats["recovered_empty"],
+        stats["parse_failures"], stats["download_failures"], stats["load_failures"], len(repaired), skipped,
+    )
 
     return {"candidates": len(candidates), **stats, "row_counts_repaired": len(repaired)}
 
@@ -529,4 +530,7 @@ def run_self_heal():
 
 if __name__ == "__main__":
 
-    run_self_heal()
+    try:
+        run_self_heal()
+    except Exception:
+        raise SystemExit(1) from None

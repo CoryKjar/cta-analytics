@@ -16,8 +16,10 @@ from zoneinfo import ZoneInfo
 import psycopg
 from dotenv import load_dotenv
 from src.config.stations import STATIONS
+from src.utils.logger import get_logger
 
 load_dotenv()
+logger = get_logger(__name__)
 
 STALE_MINUTES = int(os.getenv("COLLECTION_STALE_MINUTES", "15"))
 MAX_ATTEMPTS = int(os.getenv("SELF_HEAL_MAX_ATTEMPTS", "5"))
@@ -197,7 +199,18 @@ def send_email(subject, body):
 
 def evaluate_and_alert():
     """Alert only on new/changed issue sets; send a recovery email when healthy again."""
+    logger.info("event=health_check_started")
+    try:
+        return _evaluate_and_alert()
+    except Exception as exc:
+        logger.error("event=health_check_failed error_type=%s", type(exc).__name__)
+        raise
+
+
+def _evaluate_and_alert():
     health = collect_health()
+    for key in health["issues"]:
+        logger.error("event=health_issue issue=%s", key)
     issue_items = sorted(health["issues"].items())
     # Deduplicate by issue type, not changing counts/ages, to avoid alert spam.
     current_signature = "\n".join(k for k, _ in issue_items)
@@ -234,6 +247,7 @@ def evaluate_and_alert():
             # Persist state only after email succeeds. First clean run creates baseline silently.
             if subject:
                 send_email(subject, body)
+                logger.info("event=health_email_sent kind=%s", "alert" if current_signature else "recovery")
 
             conn.execute("""
                 INSERT INTO monitoring_alert_state
@@ -254,17 +268,18 @@ def evaluate_and_alert():
                 WHERE state_key = %s
             """, (state_key,))
 
-    print(
-        f"Health check complete: issues={len(health['issues'])}, "
-        f"latest_snapshot={health['latest_snapshot']}, "
-        f"recent_updates={health['recent_updates']}",
-        flush=True,
+    log = logger.error if health["issues"] else logger.info
+    log(
+        "event=health_check_completed issues=%s latest_snapshot=%s recent_updates=%s stale_stations=%s mismatch_count=%s",
+        len(health["issues"]), health["latest_snapshot"], health["recent_updates"],
+        len(health["stale_stations"]), health["mismatch_count"],
     )
-    for key, detail in health["issues"].items():
-        print(f"HEALTH ISSUE [{key}]: {detail}", flush=True)
     return health
 
 
 if __name__ == "__main__":
     # A DB connection failure or email failure exits non-zero so Railway logs show failure.
-    evaluate_and_alert()
+    try:
+        evaluate_and_alert()
+    except Exception:
+        raise SystemExit(1) from None

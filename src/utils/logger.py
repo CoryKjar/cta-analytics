@@ -1,5 +1,6 @@
 """Shared logging configuration with explicit UTC timestamps."""
 import logging
+from logging.handlers import RotatingFileHandler
 import sys
 import time
 from pathlib import Path
@@ -28,7 +29,19 @@ def get_logger(name="cta_pipeline"):
             datefmt="%Y-%m-%dT%H:%M:%S",
         )
 
-        file_handler = logging.FileHandler(log_folder / "pipeline.log", encoding="utf-8")
+        filename = str((log_folder / "pipeline.log").resolve())
+        file_handler = next(
+            (handler for existing in logging.Logger.manager.loggerDict.values()
+             if isinstance(existing, logging.Logger)
+             for handler in existing.handlers
+             if isinstance(handler, RotatingFileHandler) and handler.baseFilename == filename),
+            None,
+        )
+        if file_handler is None:
+            file_handler = RotatingFileHandler(
+                filename, maxBytes=5 * 1024 * 1024,
+                backupCount=3, encoding="utf-8",
+            )
         console_handler = logging.StreamHandler(sys.stdout)
         console_handler.addFilter(BelowErrorFilter())
         error_handler = logging.StreamHandler(sys.stderr)

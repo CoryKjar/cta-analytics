@@ -33,7 +33,7 @@ def main():
             logger.info("event=self_heal_completed result=%s", result)
         except Exception as exc:
             # Keep current collection running even if optional recovery fails.
-            logger.exception("event=self_heal_failed error_type=%s", type(exc).__name__)
+            logger.error("event=self_heal_failed error_type=%s", type(exc).__name__)
 
     fetched_files = fetch_arrivals()
     if not fetched_files:
@@ -67,9 +67,9 @@ def main():
                 "station_id": None,
                 "status": "failed",
                 "row_count": 0,
-                "last_error": str(exc)[:4000],
+                "last_error": f"parse: {type(exc).__name__}",
             })
-            logger.exception("event=file_parse_failed file=%s error_type=%s", path.name, type(exc).__name__)
+            logger.error("event=file_parse_failed file=%r error_type=%s", path.name, type(exc).__name__)
 
     successfully_loaded_files = set()
     loaded_rows = 0
@@ -112,4 +112,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as exc:
+        logger.error("event=pipeline_failed error_type=%s", type(exc).__name__)
+        raise SystemExit(1) from None

@@ -1,4 +1,8 @@
 from pathlib import Path
+from src.utils.logger import get_logger
+
+
+logger = get_logger(__name__)
 
 def archive_files(files):
     deleted = 0
@@ -9,4 +13,4 @@ def archive_files(files):
             file.unlink()
             deleted += 1
 
-    print(f"Removed {deleted} local staging files.")
+    logger.info("event=local_staging_cleaned files=%s", deleted)

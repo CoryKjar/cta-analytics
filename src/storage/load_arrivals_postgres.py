@@ -13,6 +13,10 @@ from src.transform.parse_arrivals import (
 )
 from src.transform.arrival_quality import resolve_unknowns
 from src.storage.quality_audit import write_quality_audit
+from src.utils.logger import get_logger
+
+
+logger = get_logger(__name__)
 
 
 def _database_url():
@@ -140,6 +144,7 @@ def load_arrivals_data(df):
         df[column] = df[column].map(parse_cta_boolean)
     df["run_number"] = df["run_number"].map(parse_cta_run_number)
 
+    resolution_events = []
     with psycopg.connect(_database_url(), connect_timeout=15) as conn:
         with conn.cursor() as cursor:
             cursor.execute("SELECT route_id, route_name FROM routes")
@@ -262,7 +267,7 @@ def load_arrivals_data(df):
                     key = collected.strftime("raw/%Y/%m/%d/") + name
                     write_quality_audit(cursor, sql.Identifier("public", "arrival_resolution_audit"),
                                         (*file_record, key), resolved, data, decisions)
-                    print(f"event=quality_resolution file_id={file_id} groups={len(decisions)}")
+                    resolution_events.append((file_id, len(decisions)))
                 canonical.extend(resolved)
             records = canonical
 
@@ -315,12 +320,9 @@ def load_arrivals_data(df):
                 (names,),
             )
 
-            print(
-    "Manifest completion update:",
-    cursor.rowcount,
-    "rows updated for",
-    len(names),
-    "source files",
-)
+            manifest_rows = cursor.rowcount
 
-    print(f"Loaded {len(records):,} parsed arrival rows from {len(file_records):,} files.")
+    for file_id, groups in resolution_events:
+        logger.info("event=quality_resolution file_id=%s groups=%s", file_id, groups)
+    logger.info("event=manifest_completed files=%s manifest_rows=%s", len(names), manifest_rows)
+    logger.info("event=arrivals_loaded arrival_rows=%s files=%s", len(records), len(file_records))
