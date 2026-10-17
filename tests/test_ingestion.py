@@ -12,7 +12,7 @@ from src.config.stations import station_id_from_filename
 from src.storage.load_arrivals_postgres import load_arrivals_data, register_file_results
 from src.storage.repair_data_quality import (
     FLAG_REPAIR_SQL, STATION_REPAIR_SQL, apply_repairs,
-    load_checkpoint, plan_boolean_batch, plan_boolean_repairs,
+    database_fingerprint, load_checkpoint, plan_boolean_batch, plan_boolean_repairs,
     plan_station_repairs, save_checkpoint, source_boolean_flags,
 )
 from src.storage.repair_data_quality import main as repair_main
@@ -93,6 +93,33 @@ class BooleanParsingTests(unittest.TestCase):
 
 
 class ArrivalLoaderTests(unittest.TestCase):
+    @patch("src.storage.load_arrivals_postgres.write_quality_audit")
+    @patch("src.storage.load_arrivals_postgres._database_url", return_value="unused")
+    @patch("src.storage.load_arrivals_postgres.psycopg.connect")
+    def test_live_loader_uses_same_unknown_policy_with_original_evidence(self, connect, database_url, audit):
+        import xml.etree.ElementTree as ET
+        root = ET.fromstring(XML_SAMPLE.format(approaching="0", delayed="1", latitude="41.9", longitude="-87.6"))
+        duplicate = ET.fromstring(ET.tostring(root.find("eta")))
+        duplicate.find("heading").text = "191"
+        duplicate.find("isDly").text = "0"
+        root.append(duplicate)
+        data = ET.tostring(root)
+        frame = parse_arrivals_xml(data, "20261016_162119_Wilson.xml")
+        cursor = connect.return_value.__enter__.return_value.cursor.return_value.__enter__.return_value
+        cursor.fetchall.side_effect = [[(1, "Red")], [(1, "Howard")], [(10, "20261016_162119_Wilson.xml")]]
+        cursor.fetchone.return_value = (False,)
+        cursor.execute.return_value.fetchall.return_value = []
+        load_arrivals_data(frame)
+        rows = cursor.executemany.call_args.args[1]
+        self.assertEqual(len(rows), 1)
+        self.assertIs(rows[0][9], False)
+        self.assertIsNone(rows[0][10])
+        self.assertIsNone(rows[0][13])
+        self.assertEqual(rows[0][11:13], (41.9, -87.6))
+        audit.assert_called_once()
+        self.assertEqual(audit.call_args.args[4], data)
+        self.assertEqual(audit.call_args.args[5][0]["null_fields"], ["heading", "is_delayed"])
+
     def test_filename_station_lookup_is_exact(self):
         self.assertEqual(station_id_from_filename("20261016_162119_Wilson.xml"), 40540)
         self.assertEqual(
@@ -268,6 +295,27 @@ class HistoricalRepairPlanTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 load_checkpoint(path, "test-database")
 
+    def test_database_identity_survives_endpoint_changes_but_rejects_other_clusters(self):
+        first, second = MagicMock(), MagicMock()
+        first.info.host, second.info.host = "localhost", "production-public-alias"
+        first.info.port, second.info.port = 61063, 5432
+        first.execute.return_value.fetchone.return_value = ("cluster-a", "railway", "16384")
+        second.execute.return_value.fetchone.return_value = ("cluster-a", "railway", "16384")
+        self.assertEqual(database_fingerprint(first), database_fingerprint(second))
+        second.execute.return_value.fetchone.return_value = ("cluster-b", "railway", "16384")
+        self.assertNotEqual(database_fingerprint(first), database_fingerprint(second))
+        second.execute.return_value.fetchone.return_value = ("cluster-a", "another-db", "16400")
+        self.assertNotEqual(database_fingerprint(first), database_fingerprint(second))
+
+    def test_legacy_checkpoint_is_not_silently_rebound(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "legacy.json"
+            path.write_text(json.dumps({"version": 1, "kind": "booleans", "database": "old-endpoint", "after": 10, "cutoff": 100}), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "Legacy checkpoint endpoint differs"):
+                load_checkpoint(path, "stable-db", legacy_database="different-endpoint")
+            self.assertEqual(load_checkpoint(path, "stable-db", legacy_database="old-endpoint"), (10, 100))
+            self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["version"], 1)
+
 
 class AutomaticRepairTests(unittest.TestCase):
     @patch("src.storage.repair_data_quality.load_dotenv")
@@ -284,7 +332,9 @@ class AutomaticRepairTests(unittest.TestCase):
 
         def execute(statement, parameters=None):
             cursor = MagicMock()
-            if "MAX(file_id)" in statement:
+            if "pg_control_system" in statement:
+                cursor.fetchone.return_value = ("test-cluster", "test-db", "16384")
+            elif "MAX(file_id)" in statement:
                 cursor.fetchone.return_value = (maximum[0],)
             elif "SELECT file_id,source_file" in statement:
                 after, cutoff, limit = parameters
@@ -323,7 +373,7 @@ class AutomaticRepairTests(unittest.TestCase):
         conn = connect.return_value.__enter__.return_value
         conn.info.host, conn.info.port, conn.info.dbname = "test-host", 5432, "test-db"
         cursor = conn.execute.return_value
-        cursor.fetchone.side_effect = [(100,), (True,), (2,)]
+        cursor.fetchone.side_effect = [("test-cluster", "test-db", "16384"), (100,), (True,), (2,)]
         cursor.fetchall.side_effect = [
             [(10, "one.xml", datetime(2026, 10, 16), 1), (11, "two.xml", datetime(2026, 10, 16), 1)],
             [(1, "Red")],

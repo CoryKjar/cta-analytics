@@ -9,7 +9,7 @@ import xml.etree.ElementTree as ET
 from requests.exceptions import Timeout, ConnectionError, HTTPError
 
 from dotenv import load_dotenv
-from src.storage.object_storage import upload_file
+from src.storage.object_storage import storage_error_details, upload_file
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 from config.stations import STATIONS
@@ -97,9 +97,11 @@ def fetch_arrivals():
             failed += 1
             # Do not log exception text or request URLs: requests exceptions can contain the API key.
             status = getattr(getattr(exc, "response", None), "status_code", None)
+            storage_code, storage_status = storage_error_details(exc)
             logger.error(
-                "event=station_collection_failed station=%s station_index=%s/%s error_type=%s http_status=%s duration_seconds=%.2f",
+                "event=station_collection_failed station=%s station_index=%s/%s error_type=%s http_status=%s storage_error_code=%s storage_http_status=%s duration_seconds=%.2f",
                 station_name, index, len(STATIONS), type(exc).__name__, status,
+                storage_code, storage_status,
                 time.monotonic() - station_started,
             )
 

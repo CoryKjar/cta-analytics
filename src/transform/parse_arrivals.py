@@ -1,4 +1,5 @@
 import xml.etree.ElementTree as ET
+import gzip
 import re
 import pandas as pd
 from pathlib import Path
@@ -31,6 +32,7 @@ def parse_cta_run_number(value):
 def parse_arrivals_xml(xml_bytes, source_file):
     """Parse the same source representation for ingestion and historical restore."""
     root = ET.fromstring(xml_bytes)
+    source_xml = gzip.compress(xml_bytes)
 
     etas = root.findall("eta")
 
@@ -87,7 +89,8 @@ def parse_arrivals_xml(xml_bytes, source_file):
             "longitude": longitude,
             "heading": heading,
             "wait_time": wait_time,
-            "source_file": Path(source_file).name
+            "source_file": Path(source_file).name,
+            "_source_xml_gzip": source_xml,
         })
 
 

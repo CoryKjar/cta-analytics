@@ -1,11 +1,17 @@
 import os
+import gzip
+from collections import Counter, defaultdict
 
 import pandas as pd
 import psycopg
+from psycopg import sql
 from dotenv import load_dotenv
 
 from src.config.stations import station_id_from_filename
 from src.transform.parse_arrivals import parse_cta_boolean, parse_cta_run_number
+from src.storage.resolve_rebuild_conflicts import resolve_unknowns
+from src.storage.restore_train_identity import source_prediction_records
+from src.storage.quality_audit import write_quality_audit
 
 
 def _database_url():
@@ -245,6 +251,35 @@ def load_arrivals_data(df):
                     )
                 )
 
+            existing_audits = cursor.execute(
+                "SELECT file_id FROM public.arrival_resolution_audit WHERE file_id=ANY(%s)",
+                (list(file_map.values()),),
+            ).fetchall()
+            audited_ids = {item[0] for item in existing_audits}
+            grouped = defaultdict(list)
+            for record in records:
+                grouped[record[5]].append(record)
+            canonical = []
+            for name, file_id in file_map.items():
+                source_rows = grouped[file_id]
+                resolved, decisions = resolve_unknowns(source_rows)
+                if decisions or file_id in audited_ids:
+                    proofs = df.loc[df["source_file"] == name, "_source_xml_gzip"].tolist() if "_source_xml_gzip" in df else []
+                    if not proofs or any(not isinstance(value, (bytes, bytearray, memoryview)) for value in proofs) or len({bytes(value) for value in proofs}) != 1:
+                        raise ValueError("Conflicting or audited replay requires preserved original XML bytes.")
+                    data = gzip.decompress(bytes(proofs[0]))
+                    collected = source_rows[0][0]
+                    file_record = (file_id, name, collected, len(source_rows))
+                    verified = source_prediction_records(data, file_record, route_map, destination_map)
+                    if Counter(verified) != Counter(source_rows):
+                        raise ValueError("Arrival rows differ from preserved source evidence.")
+                    key = collected.strftime("raw/%Y/%m/%d/") + name
+                    write_quality_audit(cursor, sql.Identifier("public", "arrival_resolution_audit"),
+                                        (*file_record, key), resolved, data, decisions)
+                    print(f"event=quality_resolution file_id={file_id} groups={len(decisions)}")
+                canonical.extend(resolved)
+            records = canonical
+
             cursor.executemany(
                 """
                 INSERT INTO arrivals (
@@ -258,11 +293,17 @@ def load_arrivals_data(df):
                     collection_timestamp, stop_id, route_id, arrival_time, run_number
                 ) DO UPDATE SET
                     is_approaching = EXCLUDED.is_approaching,
-                    is_delayed = EXCLUDED.is_delayed
+                    is_delayed = EXCLUDED.is_delayed,
+                    latitude = EXCLUDED.latitude,
+                    longitude = EXCLUDED.longitude,
+                    heading = EXCLUDED.heading
                 WHERE arrivals.file_id = EXCLUDED.file_id
                   AND (
                       arrivals.is_approaching IS DISTINCT FROM EXCLUDED.is_approaching
                       OR arrivals.is_delayed IS DISTINCT FROM EXCLUDED.is_delayed
+                      OR arrivals.latitude IS DISTINCT FROM EXCLUDED.latitude
+                      OR arrivals.longitude IS DISTINCT FROM EXCLUDED.longitude
+                      OR arrivals.heading IS DISTINCT FROM EXCLUDED.heading
                   )
                 """,
                 records,

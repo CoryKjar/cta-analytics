@@ -16,7 +16,7 @@ from dotenv import load_dotenv
 
 from src.storage.migrate_train_identity import validate_run_index
 from src.storage.object_storage import get_bucket_client
-from src.storage.repair_data_quality import load_checkpoint, save_checkpoint
+from src.storage.repair_data_quality import database_fingerprint, load_checkpoint, save_checkpoint
 from src.transform.parse_arrivals import parse_arrivals_xml
 
 
@@ -28,7 +28,8 @@ COLUMNS = (
 COLUMN_SQL = ",".join(COLUMNS)
 
 
-def source_records(xml_bytes, file_record, routes, destinations):
+def source_prediction_records(xml_bytes, file_record, routes, destinations):
+    """Normalize every XML entry without discarding duplicate-key variants."""
     file_id, filename, collected, row_count = file_record
     root = ET.fromstring(xml_bytes)
     if root.findtext("errCd", "0") != "0" or root.findtext("tmst") != collected.strftime("%Y%m%d %H:%M:%S"):
@@ -36,7 +37,7 @@ def source_records(xml_bytes, file_record, routes, destinations):
     if filename[:15] != collected.strftime("%Y%m%d_%H%M%S") or "/" in filename or "\\" in filename:
         raise ValueError("Source filename is not a valid manifest basename.")
     frame = parse_arrivals_xml(xml_bytes, filename)
-    records = {}
+    records = []
     for row in frame.to_dict("records"):
         if row["route"] not in routes or str(row["destination"]).strip() not in destinations:
             raise ValueError("Source route/destination is absent from the database dimensions.")
@@ -50,11 +51,20 @@ def source_records(xml_bytes, file_record, routes, destinations):
             int(row["heading"]) if pd.notna(row["heading"]) else None,
             float(row["wait_time"]), row["run_number"],
         )
+        records.append(values)
+    return records
+
+
+def source_records(xml_bytes, file_record, routes, destinations, *, allow_empty=False):
+    records = {}
+    for values in source_prediction_records(xml_bytes, file_record, routes, destinations):
         identity = (values[0], values[2], values[3], values[8], values[15])
         if identity in records and records[identity] != values:
             raise ValueError("Same-run source predictions still conflict; refusing to choose one.")
         records[identity] = values
     if not records:
+        if allow_empty:
+            return []
         raise ValueError("A nonempty manifest file has no source predictions.")
     if len({row[1] for row in records.values()}) != 1:
         raise ValueError("Source XML contains more than one station.")
@@ -147,8 +157,9 @@ def main():
     with psycopg.connect(url, autocommit=True, connect_timeout=15,
                          options=f"-c default_transaction_read_only={mode} -c statement_timeout=30000 -c lock_timeout=2000") as conn:
         if args.from_checkpoint:
-            database = hashlib.sha256(f"{conn.info.host}:{conn.info.port}/{conn.info.dbname}".encode()).hexdigest()
-            load_checkpoint(args.from_checkpoint, database)
+            legacy_database = hashlib.sha256(f"{conn.info.host}:{conn.info.port}/{conn.info.dbname}".encode()).hexdigest()
+            database = database_fingerprint(conn)
+            load_checkpoint(args.from_checkpoint, database, legacy_database=legacy_database)
         validate_run_index(conn)
         routes = {name: route_id for route_id, name in conn.execute("SELECT route_id,route_name FROM routes").fetchall()}
         destinations = {name: dest_id for dest_id, name in conn.execute("SELECT destination_id,destination_name FROM destinations").fetchall()}
@@ -180,7 +191,7 @@ def main():
                 print("Restores committed; checkpoint changed concurrently and was not modified.")
             else:
                 remaining = [item for item in current.get("skipped", []) if item["file_id"] not in file_ids]
-                save_checkpoint(args.from_checkpoint, current["after"], current["cutoff"], current["database"], remaining)
+                save_checkpoint(args.from_checkpoint, current["after"], current["cutoff"], database, remaining)
                 print("Unresolved checkpoint files remaining:", len(remaining))
 
 

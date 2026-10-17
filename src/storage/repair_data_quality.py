@@ -163,24 +163,39 @@ def plan_boolean_batch(conn, client, bucket, files, routes, workers, invalid_fil
     return repairs
 
 
+def database_fingerprint(conn):
+    """Identify the actual PostgreSQL database, independent of DNS aliases or tunnels."""
+    identity = conn.execute(
+        "SELECT system_identifier::text,current_database(),oid::text "
+        "FROM pg_control_system(),pg_database WHERE datname=current_database()"
+    ).fetchone()
+    if not identity or len(identity) != 3 or not all(isinstance(value, (str, int)) for value in identity):
+        raise RuntimeError("Cannot verify PostgreSQL cluster/database identity; refusing checkpoint reuse.")
+    return hashlib.sha256(json.dumps(list(map(str, identity)), separators=(",", ":")).encode()).hexdigest()
+
+
 def save_checkpoint(path, after, cutoff, database, skipped=()):
     """Atomically advance only after a batch has committed successfully."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(path.name + ".tmp")
     with temporary.open("w", encoding="utf-8") as output:
-        json.dump({"version": 1, "kind": "booleans", "after": after,
+        json.dump({"version": 2, "kind": "booleans", "after": after,
                    "cutoff": cutoff, "database": database, "skipped": list(skipped)}, output)
         output.flush()
         os.fsync(output.fileno())
     os.replace(temporary, path)
 
 
-def load_checkpoint(path, database):
+def load_checkpoint(path, database, *, legacy_database=None):
     with Path(path).open(encoding="utf-8") as source:
         saved = json.load(source)
-    if saved.get("version") != 1 or saved.get("kind") != "booleans" or saved.get("database") != database:
-        raise ValueError("Checkpoint does not match this database or repair kind.")
+    version = saved.get("version")
+    expected = database if version == 2 else legacy_database if version == 1 else None
+    if expected is None or saved.get("kind") != "booleans" or saved.get("database") != expected:
+        if version == 1:
+            raise ValueError("Legacy checkpoint endpoint differs. Verify the production database before upgrading the checkpoint; do not delete progress.")
+        raise ValueError("Checkpoint does not match this PostgreSQL database or repair kind.")
     after, cutoff = saved.get("after"), saved.get("cutoff")
     if not isinstance(after, int) or not isinstance(cutoff, int) or not 0 <= after <= cutoff:
         raise ValueError("Invalid checkpoint file-ID bounds.")
@@ -223,13 +238,14 @@ def main():
         url, connect_timeout=15, autocommit=True,
         options=f"-c default_transaction_read_only={mode} -c statement_timeout=30000 -c lock_timeout=2000",
     ) as conn:
-        database = hashlib.sha256(
+        legacy_database = hashlib.sha256(
             f"{conn.info.host}:{conn.info.port}/{conn.info.dbname}".encode()
         ).hexdigest()
+        database = database_fingerprint(conn)
         cutoff = conn.execute("SELECT COALESCE(MAX(file_id),0) FROM ingestion_files").fetchone()[0]
         skipped = []
         if args.resume:
-            args.after_file_id, cutoff = load_checkpoint(checkpoint, database)
+            args.after_file_id, cutoff = load_checkpoint(checkpoint, database, legacy_database=legacy_database)
             with Path(checkpoint).open(encoding="utf-8") as source:
                 skipped = json.load(source).get("skipped", [])
         elif args.apply and checkpoint and Path(checkpoint).exists():

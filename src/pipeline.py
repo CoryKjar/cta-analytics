@@ -9,6 +9,7 @@ from src.transform.parse_arrivals import parse_arrivals
 from src.storage.load_arrivals_postgres import load_arrivals_data, register_file_results
 from src.utils.archive import archive_files
 from src.utils.logger import get_logger
+from src.config.stations import STATIONS
 
 logger = get_logger(__name__)
 
@@ -36,8 +37,8 @@ def main():
 
     fetched_files = fetch_arrivals()
     if not fetched_files:
-        logger.warning("event=pipeline_no_files_uploaded duration_seconds=%.2f", time.monotonic() - started)
-        return
+            logger.error("event=pipeline_no_files_uploaded duration_seconds=%.2f", time.monotonic() - started)
+            raise RuntimeError("No station snapshots were successfully collected and uploaded.")
 
     parsed_frames = []
     empty_files = []
@@ -102,6 +103,12 @@ def main():
         len(fetched_files), len(successfully_loaded_files), len(successfully_empty_files),
         len(parse_failures), len(safe_to_archive), loaded_rows, time.monotonic() - started,
     )
+
+
+    if parse_failures:
+        raise RuntimeError(f"Collection completed with {len(parse_failures)} failed source files.")
+    if len(fetched_files) != len(STATIONS):
+        raise RuntimeError(f"Collection uploaded {len(fetched_files)} of {len(STATIONS)} configured station snapshots.")
 
 
 if __name__ == "__main__":

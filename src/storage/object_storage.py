@@ -1,8 +1,24 @@
 import os
+import re
 
 import boto3
 from botocore.config import Config
 from dotenv import load_dotenv
+
+
+def storage_error_details(error):
+    """Extract only safe SDK identifiers, never signed URLs or exception messages."""
+    seen = set()
+    while error is not None and id(error) not in seen:
+        seen.add(id(error))
+        response = getattr(error, "response", None)
+        if isinstance(response, dict):
+            code = str(response.get("Error", {}).get("Code", "unknown"))
+            code = code if re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", code) else "unknown"
+            status = response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+            return code, status if isinstance(status, int) else None
+        error = error.__cause__ or error.__context__
+    return "unknown", None
 
 
 def get_bucket_client(*, max_pool_connections=10):

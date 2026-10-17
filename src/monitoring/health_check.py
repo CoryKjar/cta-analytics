@@ -15,6 +15,7 @@ from zoneinfo import ZoneInfo
 
 import psycopg
 from dotenv import load_dotenv
+from src.config.stations import STATIONS
 
 load_dotenv()
 
@@ -79,6 +80,11 @@ def collect_health():
             FROM ingestion_files
             WHERE updated_at >= NOW() - INTERVAL '15 minutes'
         """).fetchone()[0]
+        station_latest = dict(conn.execute("""
+            SELECT station_id,MAX(collection_timestamp AT TIME ZONE 'America/Chicago')
+            FROM ingestion_files WHERE status='processed' AND station_id IS NOT NULL
+            GROUP BY station_id
+        """).fetchall())
 
     now = datetime.now(timezone.utc)
     age_minutes = None
@@ -93,6 +99,18 @@ def collect_health():
         age_minutes = max(0.0, (now - latest).total_seconds() / 60.0)
 
     issues = {}
+    stale_stations = []
+    for name, station_id in STATIONS.items():
+        collected = station_latest.get(station_id)
+        if collected is not None and collected.tzinfo is None:
+            collected = collected.replace(tzinfo=ZoneInfo("America/Chicago"))
+        if collected is None or (now-collected.astimezone(timezone.utc)).total_seconds()/60 > STALE_MINUTES:
+            stale_stations.append(name)
+    if stale_stations:
+        issues["station_collection_stale"] = (
+            f"{len(stale_stations)} configured station(s) have no fresh processed snapshot: "
+            + ", ".join(stale_stations[:8])
+        )
     if latest is None:
         issues["collection_stale"] = "No processed snapshots exist."
     elif age_minutes > STALE_MINUTES:
@@ -146,6 +164,7 @@ def collect_health():
         "mismatch_count": mismatch_count,
         "recent_updates": recent_updates,
         "issues": issues,
+        "stale_stations": stale_stations,
     }
 
 
