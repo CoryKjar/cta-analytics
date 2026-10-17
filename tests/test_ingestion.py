@@ -92,6 +92,32 @@ class BooleanParsingTests(unittest.TestCase):
         self.assertEqual(frame["arrival_time"].nunique(), 1)
 
 
+class APIResponseValidationTests(unittest.TestCase):
+    def test_api_errors_are_not_valid_empty_snapshots(self):
+        for code in ("100", " 100 ", "", "invalid"):
+            with self.subTest(code=code), self.assertRaisesRegex(ValueError, "API error"):
+                parse_arrivals_xml(
+                    f"<ctatt><tmst>20261016 16:21:19</tmst><errCd>{code}</errCd></ctatt>".encode(),
+                    "20261016_162119_Wilson.xml",
+                )
+
+    def test_api_error_with_predictions_is_rejected_without_exposing_error_text(self):
+        data = XML_SAMPLE.format(approaching="0", delayed="0", latitude="", longitude="")
+        data = data.replace("<ctatt>", "<ctatt><errCd>100</errCd><errNm>sensitive-source-detail</errNm>")
+        with self.assertRaisesRegex(ValueError, "API error") as raised:
+            parse_arrivals_xml(data.encode(), "20261016_162119_Wilson.xml")
+        self.assertNotIn("sensitive-source-detail", str(raised.exception))
+
+    def test_successful_empty_snapshots_remain_valid(self):
+        for error_element in ("", "<errCd>0</errCd>", "<errCd> 0 </errCd>"):
+            with self.subTest(error_element=error_element):
+                frame = parse_arrivals_xml(
+                    f"<ctatt><tmst>20261016 16:21:19</tmst>{error_element}</ctatt>".encode(),
+                    "20261016_162119_Wilson.xml",
+                )
+                self.assertTrue(frame.empty)
+
+
 class ArrivalLoaderTests(unittest.TestCase):
     @patch("src.storage.load_arrivals_postgres.write_quality_audit")
     @patch("src.storage.load_arrivals_postgres._database_url", return_value="unused")

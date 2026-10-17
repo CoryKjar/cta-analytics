@@ -11,8 +11,16 @@ __pycache__/
 # VS Code
 .vscode/
 
+# Local installers
+*.exe
+
 # Data
 data/raw/
 data/processed/
 data/database/*.db
 logs/
+
+# Generated audit reports
+/bucket-output.txt
+/data/missing_bucket_files.txt
+/data/reconciliation_report.txt

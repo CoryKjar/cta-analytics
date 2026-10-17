@@ -10,6 +10,7 @@ from requests.exceptions import Timeout, ConnectionError, HTTPError
 
 from dotenv import load_dotenv
 from src.storage.object_storage import storage_error_details, upload_file
+from src.transform.parse_arrivals import validate_cta_response
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 from config.stations import STATIONS
@@ -79,6 +80,7 @@ def fetch_arrivals():
             params = {"key": api_key, "mapid": map_id}
             response = fetch_cta_response(url, params, station_name)
             root = ET.fromstring(response.text)
+            validate_cta_response(root)
             timestamp_node = root.find("tmst")
             if timestamp_node is None or not timestamp_node.text:
                 raise ValueError("CTA response has no valid tmst timestamp.")

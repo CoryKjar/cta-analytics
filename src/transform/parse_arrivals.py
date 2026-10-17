@@ -29,9 +29,15 @@ def parse_cta_run_number(value):
     return str(value).strip()
 
 
+def validate_cta_response(root):
+    if root.findtext("errCd", "0").strip() != "0":
+        raise ValueError("CTA response reports an API error.")
+
+
 def parse_arrivals_xml(xml_bytes, source_file):
     """Parse the same source representation for ingestion and historical restore."""
     root = ET.fromstring(xml_bytes)
+    validate_cta_response(root)
     source_xml = gzip.compress(xml_bytes)
 
     etas = root.findall("eta")
