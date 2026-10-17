@@ -1,4 +1,5 @@
 import xml.etree.ElementTree as ET
+import re
 import pandas as pd
 from pathlib import Path
 
@@ -17,14 +18,25 @@ def parse_cta_boolean(value):
 
 
 def parse_arrivals(xml_file):
-    tree = ET.parse(xml_file)
-    root = tree.getroot()
+    return parse_arrivals_xml(Path(xml_file).read_bytes(), Path(xml_file).name)
+
+
+def parse_cta_run_number(value):
+    """Preserve the API train identity rather than inventing one for missing data."""
+    if pd.isna(value) or not re.fullmatch(r"[0-9]+", str(value).strip()):
+        raise ValueError("CTA prediction has no valid train run number.")
+    return str(value).strip()
+
+
+def parse_arrivals_xml(xml_bytes, source_file):
+    """Parse the same source representation for ingestion and historical restore."""
+    root = ET.fromstring(xml_bytes)
 
     etas = root.findall("eta")
 
     records = []
 
-    filename = Path(xml_file).stem
+    filename = Path(source_file).stem
     parts = filename.split("_")
 
     collection_timestamp = pd.to_datetime("_".join(parts[:2]),format="%Y%m%d_%H%M%S")
@@ -34,6 +46,7 @@ def parse_arrivals(xml_file):
         station = eta.find("staNm").text
         stop_id = eta.find("stpId").text
         route = eta.find("rt").text
+        run_number = parse_cta_run_number(eta.findtext("rn"))
         destination = eta.find("destNm").text
         direction = eta.find("trDr").text
 
@@ -63,6 +76,7 @@ def parse_arrivals(xml_file):
             "station": station,
             "stop_id": stop_id,
             "route": route,
+            "run_number": run_number,
             "destination": destination,
             "direction": direction,
             "prediction_time": prediction_time,
@@ -73,7 +87,7 @@ def parse_arrivals(xml_file):
             "longitude": longitude,
             "heading": heading,
             "wait_time": wait_time,
-            "source_file": Path(xml_file).name
+            "source_file": Path(source_file).name
         })
 
 

@@ -5,7 +5,7 @@ from botocore.config import Config
 from dotenv import load_dotenv
 
 
-def get_bucket_client():
+def get_bucket_client(*, max_pool_connections=10):
     load_dotenv()
 
     endpoint = os.getenv("ENDPOINT")
@@ -25,6 +25,7 @@ def get_bucket_client():
         aws_secret_access_key=secret_key,
         region_name=region,
         config=Config(
+            max_pool_connections=max_pool_connections,
             s3={
                 "addressing_style": "virtual"
             }

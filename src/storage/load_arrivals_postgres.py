@@ -5,7 +5,7 @@ import psycopg
 from dotenv import load_dotenv
 
 from src.config.stations import station_id_from_filename
-from src.transform.parse_arrivals import parse_cta_boolean
+from src.transform.parse_arrivals import parse_cta_boolean, parse_cta_run_number
 
 
 def _database_url():
@@ -137,7 +137,7 @@ def load_arrivals_data(df):
         "source_file", "collection_timestamp", "station_id", "stop_id",
         "route", "destination", "direction", "prediction_time",
         "arrival_time", "is_approaching", "is_delayed", "latitude",
-        "longitude", "heading", "wait_time",
+        "longitude", "heading", "wait_time", "run_number",
     }
     missing = required - set(df.columns)
     if missing:
@@ -146,6 +146,7 @@ def load_arrivals_data(df):
     df = df.copy()
     for column in ("is_approaching", "is_delayed"):
         df[column] = df[column].map(parse_cta_boolean)
+    df["run_number"] = df["run_number"].map(parse_cta_run_number)
 
     with psycopg.connect(_database_url(), connect_timeout=15) as conn:
         with conn.cursor() as cursor:
@@ -211,6 +212,16 @@ def load_arrivals_data(df):
             )
             file_map = {name: file_id for file_id, name in cursor.fetchall()}
 
+            cursor.execute(
+                "SELECT EXISTS (SELECT 1 FROM arrivals WHERE file_id=ANY(%s) "
+                "AND collection_timestamp BETWEEN %s AND %s AND run_number IS NULL)",
+                (list(file_map.values()),
+                 pd.Timestamp(df["collection_timestamp"].min()).to_pydatetime(),
+                 pd.Timestamp(df["collection_timestamp"].max()).to_pydatetime()),
+            )
+            if cursor.fetchone()[0]:
+                raise ValueError("Legacy arrivals need source-backed train restoration before replay.")
+
             records = []
             for _, row in df.iterrows():
                 records.append(
@@ -230,6 +241,7 @@ def load_arrivals_data(df):
                         float(row["longitude"]) if pd.notna(row["longitude"]) else None,
                         int(row["heading"]) if pd.notna(row["heading"]) else None,
                         float(row["wait_time"]) if pd.notna(row["wait_time"]) else None,
+                        row["run_number"],
                     )
                 )
 
@@ -239,11 +251,11 @@ def load_arrivals_data(df):
                     collection_timestamp, station_id, stop_id, route_id,
                     destination_id, file_id, direction, prediction_time,
                     arrival_time, is_approaching, is_delayed, latitude,
-                    longitude, heading, wait_time
+                    longitude, heading, wait_time, run_number
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (
-                    collection_timestamp, stop_id, route_id, arrival_time
+                    collection_timestamp, stop_id, route_id, arrival_time, run_number
                 ) DO UPDATE SET
                     is_approaching = EXCLUDED.is_approaching,
                     is_delayed = EXCLUDED.is_delayed
