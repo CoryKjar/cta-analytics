@@ -8,9 +8,10 @@ from psycopg import sql
 from dotenv import load_dotenv
 
 from src.config.stations import station_id_from_filename
-from src.transform.parse_arrivals import parse_cta_boolean, parse_cta_run_number
-from src.storage.resolve_rebuild_conflicts import resolve_unknowns
-from src.storage.restore_train_identity import source_prediction_records
+from src.transform.parse_arrivals import (
+    parse_cta_boolean, parse_cta_run_number, source_prediction_records,
+)
+from src.transform.arrival_quality import resolve_unknowns
 from src.storage.quality_audit import write_quality_audit
 
 
@@ -117,21 +118,6 @@ def register_file_results(results):
                 """,
                 records,
             )
-
-
-def register_file_result(
-    source_file, collection_timestamp, *, status, row_count=0,
-    station_id=None, last_error=None
-):
-    """Compatibility wrapper for a single file."""
-    register_file_results([{
-        "source_file": source_file,
-        "collection_timestamp": collection_timestamp,
-        "status": status,
-        "row_count": row_count,
-        "station_id": station_id,
-        "last_error": last_error,
-    }])
 
 
 def load_arrivals_data(df):

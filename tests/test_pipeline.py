@@ -1,4 +1,6 @@
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -11,6 +13,19 @@ from src.pipeline import main
 from src.ingestion.fetch_arrivals import fetch_arrivals
 from src.transform.parse_arrivals import parse_arrivals
 from src.storage.object_storage import storage_error_details
+
+
+class PipelineImportTests(unittest.TestCase):
+    def test_collector_and_recovery_do_not_import_operator_commands(self):
+        result = subprocess.run(
+            [sys.executable, "-B", "-c",
+             "import sys; import src.pipeline; import src.storage.self_heal; "
+             "commands = [name for name in sys.modules if name.startswith('src.scripts.')]; "
+             "assert not commands, commands"],
+            cwd=Path(__file__).resolve().parents[1],
+            capture_output=True, text=True, timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
 
 
 class FetchResponseValidationTests(unittest.TestCase):

@@ -1,4 +1,6 @@
-# Production Repair Runbook
+# Historical Production Repair Record
+
+This document records the completed October 17 repair, not current operating instructions. The one-off repair and observer programs have been retired from the runtime checkout; their last deployed versions remain in Git commit `573f224`. Retained database tables, original XML and backups are unchanged. Do not rerun historical backfills on the repaired database.
 
 Authorized scope: align live ingestion/replay/recovery with the audited source policy, finish the staged historical catch-up, deploy compatible code, perform a guarded table cutover, and continue until runtime monitoring gates pass. Retain rollback data; do not delete old tables or raw XML.
 
@@ -26,7 +28,7 @@ During the authorized short window, stop collector/recovery and any local repair
 
 ## Monitoring Gate
 
-Use `python -m src.monitoring.verify_production --since <UTC-cutover-instant>`. It follows actual Railway runtime events, not artificial successful test calls. Required:
+The temporary post-cutover observer followed actual Railway runtime events, not artificial successful test calls. Its required gates were:
 
 1. Three consecutive clean scheduled collector completions with every configured station uploaded and loaded/registered; a gap greater than eight minutes resets the consecutive count.
 2. Two clean scheduled health checks after cutover.
@@ -36,4 +38,6 @@ Use `python -m src.monitoring.verify_production --since <UTC-cutover-instant>`. 
 
 Any runtime error or health issue fails the gate; investigate and restart observation after repair. SMTP TLS/authentication was checked separately without sending a test message. Actual inbox delivery is not inferred from successful authentication.
 
-Final results are recorded separately after the observed gate. Historical snapshots absent from the bucket cannot be reconstructed; keep their documented gaps rather than fabricate records. Do not remove rollback tables/backups until separately approved retention expires.
+The cutover committed at 2026-10-17 04:54:43 UTC with 3,570,173 predictions across 469,147 manifest files. Validation found zero missing run numbers, manifest count mismatches, processing-history changes or failures among the 1,982 source audits. The observed gate passed with three consecutive clean collector runs, three clean health checks and one clean recovery run. The temporary observer trigger and function were removed afterward.
+
+Historical snapshots absent from the bucket cannot be reconstructed; keep their documented gaps rather than fabricate records. Do not remove rollback tables/backups until separately approved retention expires.

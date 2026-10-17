@@ -101,3 +101,30 @@ def parse_arrivals_xml(xml_bytes, source_file):
 
 
     return pd.DataFrame(records)
+
+
+def source_prediction_records(xml_bytes, file_record, routes, destinations):
+    """Verify source metadata and normalize rows for audited ingestion/replay."""
+    file_id, filename, collected, row_count = file_record
+    root = ET.fromstring(xml_bytes)
+    if root.findtext("errCd", "0") != "0" or root.findtext("tmst") != collected.strftime("%Y%m%d %H:%M:%S"):
+        raise ValueError("Source API timestamp/error does not match the manifest.")
+    if filename[:15] != collected.strftime("%Y%m%d_%H%M%S") or "/" in filename or "\\" in filename:
+        raise ValueError("Source filename is not a valid manifest basename.")
+    frame = parse_arrivals_xml(xml_bytes, filename)
+    records = []
+    for row in frame.to_dict("records"):
+        if row["route"] not in routes or str(row["destination"]).strip() not in destinations:
+            raise ValueError("Source route/destination is absent from the database dimensions.")
+        values = (
+            collected, int(row["station_id"]), int(row["stop_id"]), routes[row["route"]],
+            destinations[str(row["destination"]).strip()], file_id, row["direction"],
+            pd.Timestamp(row["prediction_time"]).to_pydatetime(),
+            pd.Timestamp(row["arrival_time"]).to_pydatetime(), row["is_approaching"], row["is_delayed"],
+            float(row["latitude"]) if pd.notna(row["latitude"]) else None,
+            float(row["longitude"]) if pd.notna(row["longitude"]) else None,
+            int(row["heading"]) if pd.notna(row["heading"]) else None,
+            float(row["wait_time"]), row["run_number"],
+        )
+        records.append(values)
+    return records

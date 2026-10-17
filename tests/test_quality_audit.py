@@ -5,7 +5,7 @@ from unittest.mock import MagicMock
 from psycopg import sql
 
 from src.storage.quality_audit import write_quality_audit
-from src.storage.resolve_rebuild_conflicts import POLICY
+from src.transform.arrival_quality import POLICY
 
 
 class QualityAuditReplayTests(unittest.TestCase):

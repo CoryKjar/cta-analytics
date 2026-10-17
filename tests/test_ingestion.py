@@ -1,8 +1,5 @@
-import json
-import os
 import tempfile
 import unittest
-from datetime import datetime
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -10,14 +7,9 @@ import pandas as pd
 
 from src.config.stations import station_id_from_filename
 from src.storage.load_arrivals_postgres import load_arrivals_data, register_file_results
-from src.storage.repair_data_quality import (
-    FLAG_REPAIR_SQL, STATION_REPAIR_SQL, apply_repairs,
-    database_fingerprint, load_checkpoint, plan_boolean_batch, plan_boolean_repairs,
-    plan_station_repairs, save_checkpoint, source_boolean_flags,
-)
-from src.storage.repair_data_quality import main as repair_main
 from src.transform.parse_arrivals import (
     parse_arrivals, parse_arrivals_xml, parse_cta_boolean, parse_cta_run_number,
+    source_prediction_records,
 )
 
 
@@ -118,6 +110,32 @@ class APIResponseValidationTests(unittest.TestCase):
                 self.assertTrue(frame.empty)
 
 
+class SourceVerificationTests(unittest.TestCase):
+    def setUp(self):
+        self.collected = pd.Timestamp("2026-10-16 16:21:19").to_pydatetime()
+        self.record = (10, "20261016_162119_Wilson.xml", self.collected, 1)
+        self.data = XML_SAMPLE.format(
+            approaching="0", delayed="1", latitude="41.9", longitude="-87.6",
+        ).encode()
+
+    def test_source_records_match_the_loader_column_contract(self):
+        rows = source_prediction_records(self.data, self.record, {"Red": 1}, {"Howard": 2})
+        self.assertEqual(rows, [(
+            self.collected, 40540, 30105, 1, 2, 10, "1",
+            pd.Timestamp("2026-10-16 16:21:00").to_pydatetime(),
+            pd.Timestamp("2026-10-16 16:25:00").to_pydatetime(),
+            False, True, 41.9, -87.6, 0, 4.0, "812",
+        )])
+
+    def test_source_metadata_and_unknown_dimensions_are_rejected(self):
+        wrong = (*self.record[:2], pd.Timestamp("2026-10-15").to_pydatetime(), 1)
+        with self.assertRaisesRegex(ValueError, "timestamp/error"):
+            source_prediction_records(self.data, wrong, {"Red": 1}, {"Howard": 2})
+        for routes, destinations in (({}, {"Howard": 2}), ({"Red": 1}, {})):
+            with self.subTest(routes=routes, destinations=destinations), self.assertRaisesRegex(ValueError, "dimensions"):
+                source_prediction_records(self.data, self.record, routes, destinations)
+
+
 class ArrivalLoaderTests(unittest.TestCase):
     @patch("src.storage.load_arrivals_postgres.write_quality_audit")
     @patch("src.storage.load_arrivals_postgres._database_url", return_value="unused")
@@ -199,217 +217,6 @@ class ArrivalLoaderTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             load_arrivals_data(frame)
         connect.assert_not_called()
-
-
-class HistoricalRepairPlanTests(unittest.TestCase):
-    def setUp(self):
-        self.collected = datetime(2026, 10, 16, 16, 21, 19)
-        self.record = (10, "20261016_162119_Wilson.xml", self.collected, 1)
-        self.xml = XML_SAMPLE.format(approaching="0", delayed="0", latitude="", longitude="").encode()
-        self.identity = (40540, 30105, 1, datetime(2026, 10, 16, 16, 21), datetime(2026, 10, 16, 16, 25))
-
-    def test_station_backfill_requires_known_database_station(self):
-        repairs, unresolved = plan_station_repairs([self.record], {40540})
-        self.assertEqual(repairs, [(40540, 10)])
-        self.assertEqual(unresolved, [])
-        self.assertEqual(plan_station_repairs([self.record], set()), ([], [self.record[1]]))
-        self.assertNotIn("updated_at", STATION_REPAIR_SQL)
-        self.assertNotIn("processed_at", STATION_REPAIR_SQL)
-
-    def test_source_backed_flag_repair_uses_exact_identity_and_old_values(self):
-        flags = source_boolean_flags(self.xml, self.collected, {"Red": 1})
-        repairs = plan_boolean_repairs(self.record, [(*self.identity, True, True)], flags)
-        self.assertEqual(repairs, [(False, False, 10, self.collected, *self.identity, True, True)])
-        self.assertEqual(plan_boolean_repairs(self.record, [(*self.identity, False, False)], flags), [])
-        self.assertNotIn("processed_at", FLAG_REPAIR_SQL)
-        self.assertIn("IS NOT DISTINCT FROM", FLAG_REPAIR_SQL)
-
-    def test_wrong_source_timestamp_or_prediction_refuses_repair(self):
-        with self.assertRaises(ValueError):
-            source_boolean_flags(self.xml, datetime(2026, 10, 15), {"Red": 1})
-        with self.assertRaises(ValueError):
-            source_boolean_flags(self.xml, self.collected, {})
-        with self.assertRaises(ValueError):
-            plan_boolean_repairs(self.record, [(*self.identity, True, True)], {})
-        with self.assertRaises(ValueError):
-            plan_boolean_repairs(self.record, [], {})
-
-    def test_apply_requires_every_planned_row_to_match(self):
-        conn = MagicMock()
-        cursor = conn.cursor.return_value.__enter__.return_value
-        cursor.rowcount = 0
-        with self.assertRaises(RuntimeError):
-            apply_repairs(conn, STATION_REPAIR_SQL, [(40540, 10)])
-        conn.transaction.return_value.__exit__.assert_called_once()
-
-    @patch("src.storage.repair_data_quality.read_source_flags")
-    def test_parallel_batch_reads_database_once_and_matches_by_file(self, read_source):
-        conn = MagicMock()
-        second = (11, self.record[1], self.collected, 1)
-        conn.execute.return_value.fetchall.return_value = [
-            (11, *self.identity, True, True), (10, *self.identity, True, True),
-        ]
-        read_source.side_effect = lambda client, bucket, record, routes: {
-            self.identity: (False, record[0] == 11),
-        }
-        repairs = plan_boolean_batch(conn, MagicMock(), "unused", [self.record, second], {"Red": 1}, 2)
-        self.assertEqual(repairs, [
-            (False, False, 10, self.collected, *self.identity, True, True),
-            (False, True, 11, self.collected, *self.identity, True, True),
-        ])
-        conn.execute.assert_called_once()
-        self.assertEqual(conn.execute.call_args.args[1], (self.collected, self.collected, [10, 11]))
-
-    @patch("src.storage.repair_data_quality.read_source_flags", side_effect=ValueError("Bad source"))
-    def test_source_failure_prevents_batch_plan(self, read_source):
-        conn = MagicMock()
-        conn.execute.return_value.fetchall.return_value = [(10, *self.identity, True, True)]
-        with self.assertRaisesRegex(ValueError, "Bad source"):
-            plan_boolean_batch(conn, MagicMock(), "unused", [self.record], {"Red": 1}, 2)
-        conn.transaction.assert_not_called()
-
-    @patch("src.storage.repair_data_quality.read_source_flags")
-    def test_explicit_skip_leaves_invalid_file_unchanged_and_reports_it(self, read_source):
-        conn = MagicMock()
-        conn.execute.return_value.fetchall.return_value = [
-            (10, *self.identity, True, True), (11, *self.identity, True, True),
-        ]
-        def read(client, bucket, record, routes):
-            if record[0] == 10:
-                raise ValueError("Conflicting source flags")
-            return {self.identity: (False, False)}
-        read_source.side_effect = read
-        invalid = []
-        second = (11, self.record[1], self.collected, 1)
-        repairs = plan_boolean_batch(conn, MagicMock(), "unused", [self.record, second], {"Red": 1}, 2, invalid)
-        self.assertEqual(repairs, [(False, False, 11, self.collected, *self.identity, True, True)])
-        self.assertEqual(invalid, [{"file_id": 10, "reason": "Conflicting source flags"}])
-
-    def test_checkpoints_preserve_unresolved_files(self):
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "flags.json"
-            skipped = [{"file_id": 10, "reason": "Conflicting source flags"}]
-            save_checkpoint(path, 20, 100, "test-db", skipped)
-            self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["skipped"], skipped)
-
-    def test_run_aware_flags_keep_same_time_trains_separate(self):
-        flags = {(*self.identity, "812"): (True, True), (*self.identity, "916"): (True, False)}
-        record = (*self.record[:3], 2)
-        stored = [(*self.identity, True, True, "812"), (*self.identity, True, True, "916")]
-        repairs = plan_boolean_repairs(record, stored, flags, include_runs=True)
-        self.assertEqual(len(repairs), 1)
-        self.assertEqual(repairs[0][-1], "916")
-        self.assertEqual(repairs[0][:2], (True, False))
-        with self.assertRaisesRegex(ValueError, "Legacy train identity"):
-            plan_boolean_repairs(self.record, [(*self.identity, True, True, None)], flags, include_runs=True)
-
-    def test_checkpoint_round_trip_and_database_guard(self):
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "progress" / "flags.json"
-            save_checkpoint(path, 10, 100, "test-database")
-            self.assertEqual(load_checkpoint(path, "test-database"), (10, 100))
-            self.assertFalse(path.with_name(path.name + ".tmp").exists())
-            with self.assertRaises(ValueError):
-                load_checkpoint(path, "different-database")
-            save_checkpoint(path, 20, 100, "test-database")
-            self.assertEqual(load_checkpoint(path, "test-database"), (20, 100))
-
-    def test_checkpoint_rejects_impossible_bounds(self):
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "flags.json"
-            save_checkpoint(path, 200, 100, "test-database")
-            with self.assertRaises(ValueError):
-                load_checkpoint(path, "test-database")
-
-    def test_database_identity_survives_endpoint_changes_but_rejects_other_clusters(self):
-        first, second = MagicMock(), MagicMock()
-        first.info.host, second.info.host = "localhost", "production-public-alias"
-        first.info.port, second.info.port = 61063, 5432
-        first.execute.return_value.fetchone.return_value = ("cluster-a", "railway", "16384")
-        second.execute.return_value.fetchone.return_value = ("cluster-a", "railway", "16384")
-        self.assertEqual(database_fingerprint(first), database_fingerprint(second))
-        second.execute.return_value.fetchone.return_value = ("cluster-b", "railway", "16384")
-        self.assertNotEqual(database_fingerprint(first), database_fingerprint(second))
-        second.execute.return_value.fetchone.return_value = ("cluster-a", "another-db", "16400")
-        self.assertNotEqual(database_fingerprint(first), database_fingerprint(second))
-
-    def test_legacy_checkpoint_is_not_silently_rebound(self):
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "legacy.json"
-            path.write_text(json.dumps({"version": 1, "kind": "booleans", "database": "old-endpoint", "after": 10, "cutoff": 100}), encoding="utf-8")
-            with self.assertRaisesRegex(ValueError, "Legacy checkpoint endpoint differs"):
-                load_checkpoint(path, "stable-db", legacy_database="different-endpoint")
-            self.assertEqual(load_checkpoint(path, "stable-db", legacy_database="old-endpoint"), (10, 100))
-            self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["version"], 1)
-
-
-class AutomaticRepairTests(unittest.TestCase):
-    @patch("src.storage.repair_data_quality.load_dotenv")
-    @patch("src.storage.repair_data_quality.get_bucket_client")
-    @patch("src.storage.repair_data_quality.plan_boolean_batch", return_value=[("planned",)])
-    @patch("src.storage.repair_data_quality.apply_repairs")
-    @patch("src.storage.repair_data_quality.psycopg.connect")
-    def test_all_and_resume_use_committed_checkpoint_and_fixed_cutoff(self, connect, apply, plan, client, load_env):
-        conn = connect.return_value.__enter__.return_value
-        conn.info.host, conn.info.port, conn.info.dbname = "test-host", 5432, "test-db"
-        maximum = [100]
-        records = [(file_id, "sample.xml", datetime(2026, 10, 16), 1) for file_id in (10, 11, 12, 150)]
-        bounds = []
-
-        def execute(statement, parameters=None):
-            cursor = MagicMock()
-            if "pg_control_system" in statement:
-                cursor.fetchone.return_value = ("test-cluster", "test-db", "16384")
-            elif "MAX(file_id)" in statement:
-                cursor.fetchone.return_value = (maximum[0],)
-            elif "SELECT file_id,source_file" in statement:
-                after, cutoff, limit = parameters
-                bounds.append(cutoff)
-                cursor.fetchall.return_value = [record for record in records if after < record[0] <= cutoff][:limit]
-            elif "SELECT COUNT(*)" in statement:
-                after, cutoff = parameters
-                cursor.fetchone.return_value = (sum(after < record[0] <= cutoff for record in records),)
-            elif "SELECT EXISTS" in statement:
-                cursor.fetchone.return_value = (True,)
-            else:
-                cursor.fetchall.return_value = [(1, "Red")]
-            return cursor
-
-        conn.execute.side_effect = execute
-        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"DATABASE_URL": "unused", "BUCKET": "unused"}):
-            path = Path(directory) / "checkpoint.json"
-            arguments = ["repair", "--kind", "booleans", "--all", "--apply", "--limit", "2", "--batch-size", "1", "--checkpoint", str(path)]
-            with patch("sys.argv", arguments):
-                repair_main()
-            saved = json.loads(path.read_text(encoding="utf-8"))
-            self.assertEqual((saved["after"], saved["cutoff"]), (12, 100))
-            self.assertEqual(apply.call_count, 3)
-            maximum[0] = 200
-            with patch("sys.argv", ["repair", "--kind", "booleans", "--resume", "--apply", "--checkpoint", str(path)]):
-                repair_main()
-            self.assertEqual(apply.call_count, 3)
-            self.assertTrue(all(cutoff == 100 for cutoff in bounds))
-
-    @patch("src.storage.repair_data_quality.load_dotenv")
-    @patch("src.storage.repair_data_quality.get_bucket_client")
-    @patch("src.storage.repair_data_quality.plan_boolean_batch", return_value=[("planned",)])
-    @patch("src.storage.repair_data_quality.apply_repairs", side_effect=[None, RuntimeError("rolled back")])
-    @patch("src.storage.repair_data_quality.psycopg.connect")
-    def test_failed_second_batch_does_not_advance_progress(self, connect, apply, plan, client, load_env):
-        conn = connect.return_value.__enter__.return_value
-        conn.info.host, conn.info.port, conn.info.dbname = "test-host", 5432, "test-db"
-        cursor = conn.execute.return_value
-        cursor.fetchone.side_effect = [("test-cluster", "test-db", "16384"), (100,), (True,), (2,)]
-        cursor.fetchall.side_effect = [
-            [(10, "one.xml", datetime(2026, 10, 16), 1), (11, "two.xml", datetime(2026, 10, 16), 1)],
-            [(1, "Red")],
-        ]
-        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"DATABASE_URL": "unused", "BUCKET": "unused"}):
-            path = Path(directory) / "checkpoint.json"
-            with patch("sys.argv", ["repair", "--kind", "booleans", "--all", "--apply", "--batch-size", "1", "--checkpoint", str(path)]):
-                with self.assertRaisesRegex(RuntimeError, "rolled back"):
-                    repair_main()
-            self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["after"], 10)
 
 
 if __name__ == "__main__":

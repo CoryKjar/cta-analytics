@@ -1,9 +1,7 @@
 import unittest
 from datetime import datetime
 
-from unittest.mock import MagicMock
-
-from src.storage.resolve_rebuild_conflicts import apply_resolution_batch, canonical_rows_match, resolve_unknowns
+from src.transform.arrival_quality import COLUMNS, resolve_unknowns
 
 
 class UnknownResolutionTests(unittest.TestCase):
@@ -15,7 +13,6 @@ class UnknownResolutionTests(unittest.TestCase):
         )
 
     def variant(self, **changes):
-        from src.storage.restore_train_identity import COLUMNS
         row = list(self.row)
         for name, value in changes.items():
             row[COLUMNS.index(name)] = value
@@ -60,21 +57,6 @@ class UnknownResolutionTests(unittest.TestCase):
         before = [row[:] for row in source]
         resolve_unknowns(source)
         self.assertEqual(source, before)
-
-    def test_canonical_comparison_allows_real_precision_but_not_unknown_overwrite(self):
-        expected = self.variant(heading=None)
-        self.assertTrue(canonical_rows_match([self.variant(heading=None, latitude=41.900001)], [expected]))
-        self.assertFalse(canonical_rows_match([self.row], [expected]))
-        self.assertFalse(canonical_rows_match([self.variant(heading=None, is_delayed=True)], [expected]))
-
-    def test_apply_refuses_concurrent_file_state_before_writing(self):
-        conn = MagicMock()
-        conn.execute.return_value.fetchall.return_value = []
-        plan = {"record": (1, "source.xml", self.row[0], 1, "raw/source.xml", "etag")}
-        with self.assertRaisesRegex(RuntimeError, "state changed"):
-            apply_resolution_batch(conn, "cta_rebuild_test", [plan])
-        conn.cursor.assert_not_called()
-
 
 if __name__ == "__main__":
     unittest.main()

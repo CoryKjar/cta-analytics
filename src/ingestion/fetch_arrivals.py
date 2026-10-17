@@ -1,19 +1,17 @@
 import os
-import sys
 import random
 import time
 from pathlib import Path
 from datetime import datetime
 import requests
 import xml.etree.ElementTree as ET
-from requests.exceptions import Timeout, ConnectionError, HTTPError
+from requests.exceptions import Timeout, ConnectionError
 
 from dotenv import load_dotenv
+from src.config.stations import STATIONS
 from src.storage.object_storage import storage_error_details, upload_file
 from src.transform.parse_arrivals import validate_cta_response
 
-sys.path.append(str(Path(__file__).resolve().parents[1]))
-from config.stations import STATIONS
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)

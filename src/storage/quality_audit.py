@@ -1,4 +1,4 @@
-"""Shared lossless audit writes for live ingestion and isolated rebuilds."""
+"""Preserve immutable source evidence for live ingestion and recovery."""
 import gzip
 import hashlib
 import json
@@ -6,18 +6,7 @@ import json
 from psycopg import sql
 from psycopg.types.json import Jsonb
 
-from src.storage.resolve_rebuild_conflicts import POLICY
-
-
-def ensure_audit_table(conn, destination, reference):
-    conn.execute(sql.SQL("""
-        CREATE TABLE IF NOT EXISTS {} (
-            file_id integer PRIMARY KEY REFERENCES {}(file_id),
-            policy text NOT NULL,source_sha256 text NOT NULL,source_etag text,
-            source_xml_gzip bytea NOT NULL,evidence jsonb NOT NULL,
-            canonical_row_count integer NOT NULL,resolved_at timestamptz NOT NULL DEFAULT NOW()
-        )
-    """).format(destination, reference))
+from src.transform.arrival_quality import POLICY
 
 
 def write_quality_audit(cursor, destination, record, rows, data, decisions, *, etag=None):
