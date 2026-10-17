@@ -4,6 +4,9 @@ import pandas as pd
 import psycopg
 from dotenv import load_dotenv
 
+from src.config.stations import station_id_from_filename
+from src.transform.parse_arrivals import parse_cta_boolean
+
 
 def _database_url():
     load_dotenv()
@@ -27,7 +30,8 @@ def register_file_results(results):
         (
             item["source_file"],
             item["collection_timestamp"],
-            item.get("station_id"),
+            item["station_id"] if item.get("station_id") is not None
+            else station_id_from_filename(item["source_file"]),
             item["status"],
             int(item.get("row_count", 0)),
             item["status"],
@@ -139,6 +143,10 @@ def load_arrivals_data(df):
     if missing:
         raise ValueError(f"Arrival DataFrame missing columns: {sorted(missing)}")
 
+    df = df.copy()
+    for column in ("is_approaching", "is_delayed"):
+        df[column] = df[column].map(parse_cta_boolean)
+
     with psycopg.connect(_database_url(), connect_timeout=15) as conn:
         with conn.cursor() as cursor:
             cursor.execute("SELECT route_id, route_name FROM routes")
@@ -216,8 +224,8 @@ def load_arrivals_data(df):
                         row["direction"],
                         pd.Timestamp(row["prediction_time"]).to_pydatetime(),
                         pd.Timestamp(row["arrival_time"]).to_pydatetime(),
-                        bool(row["is_approaching"]) if pd.notna(row["is_approaching"]) else None,
-                        bool(row["is_delayed"]) if pd.notna(row["is_delayed"]) else None,
+                        parse_cta_boolean(row["is_approaching"]),
+                        parse_cta_boolean(row["is_delayed"]),
                         float(row["latitude"]) if pd.notna(row["latitude"]) else None,
                         float(row["longitude"]) if pd.notna(row["longitude"]) else None,
                         int(row["heading"]) if pd.notna(row["heading"]) else None,
@@ -236,7 +244,14 @@ def load_arrivals_data(df):
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (
                     collection_timestamp, stop_id, route_id, arrival_time
-                ) DO NOTHING
+                ) DO UPDATE SET
+                    is_approaching = EXCLUDED.is_approaching,
+                    is_delayed = EXCLUDED.is_delayed
+                WHERE arrivals.file_id = EXCLUDED.file_id
+                  AND (
+                      arrivals.is_approaching IS DISTINCT FROM EXCLUDED.is_approaching
+                      OR arrivals.is_delayed IS DISTINCT FROM EXCLUDED.is_delayed
+                  )
                 """,
                 records,
             )

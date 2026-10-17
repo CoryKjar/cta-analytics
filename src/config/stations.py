@@ -1,3 +1,7 @@
+import re
+from pathlib import Path
+
+
 STATIONS = {
     "18th": 40830,
     "35th_Bronzeville_IIT": 41120,
@@ -143,3 +147,9 @@ STATIONS = {
     "Wilson": 40540,
     "Merchandise_Mart": 40460,
 }
+
+
+def station_id_from_filename(source_file):
+    """Resolve exact configured station names, including names with underscores."""
+    match = re.fullmatch(r"[0-9]{8}_[0-9]{6}_(.+)[.]xml", Path(source_file).name)
+    return STATIONS.get(match.group(1)) if match else None

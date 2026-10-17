@@ -1,8 +1,20 @@
 import xml.etree.ElementTree as ET
 import pandas as pd
 from pathlib import Path
-from datetime import datetime
-import shutil
+
+
+def parse_cta_boolean(value):
+    """Parse CTA's binary flag without treating the nonempty string '0' as true."""
+    if isinstance(value, str):
+        value = value.strip()
+    if pd.isna(value) or value == "":
+        return None
+    if value in (False, "0"):
+        return False
+    if value in (True, "1"):
+        return True
+    raise ValueError(f"Invalid CTA boolean flag: {value!r}")
+
 
 def parse_arrivals(xml_file):
     tree = ET.parse(xml_file)
@@ -35,8 +47,8 @@ def parse_arrivals(xml_file):
             format="%Y%m%d %H:%M:%S"
         )
 
-        is_approaching = eta.find("isApp").text
-        is_delayed = eta.find("isDly").text
+        is_approaching = parse_cta_boolean(eta.find("isApp").text)
+        is_delayed = parse_cta_boolean(eta.find("isDly").text)
         latitude = eta.find("lat").text
         longitude = eta.find("lon").text
         heading = eta.find("heading").text
@@ -66,33 +78,3 @@ def parse_arrivals(xml_file):
 
 
     return pd.DataFrame(records)
-
-def parse_all_arrivals(folder):
-    all_dfs = []
-    processed_files = []
-
-    xml_files = list(Path(folder).glob("*.xml"))
-
-    print(f"Found {len(xml_files)} XML files to parse.")
-
-    for xml_file in xml_files:
-        df = parse_arrivals(xml_file)
-        all_dfs.append(df)
-        processed_files.append(xml_file)
-
-        print(f"Parsed {xml_file.name}: {len(df)} arrivals")
-
-    combined_df = pd.concat(all_dfs, ignore_index=True)
-
-    print(
-        f"Finished parsing {len(xml_files)} files. "
-        f"Total arrivals: {len(combined_df)}"
-    )
-
-    return combined_df, processed_files
-
-
-if __name__ == "__main__":
-    df = parse_all_arrivals("data/raw/arrivals")
-
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
