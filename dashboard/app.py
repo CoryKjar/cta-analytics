@@ -1,5 +1,6 @@
 """Read-only Streamlit dashboard for the CTA pipeline."""
 import os
+import json
 import sys
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -13,10 +14,44 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from dashboard.manifest_status import build_manifest_status_view  # noqa: E402
-from dashboard.manifest_history import fetch_manifest_history  # noqa: E402
+from dashboard.manifest_history import fetch_manifest_history, fetch_validation_history  # noqa: E402
 from src.monitoring.health_check import collect_health  # noqa: E402
 
 load_dotenv()
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def validation_history():
+    return fetch_validation_history()
+
+
+def plot_history(frame, columns, height=260):
+    columns = [columns] if isinstance(columns, str) else columns
+    chart = frame[["Hour", *columns]].copy()
+    chart["Hour index"] = range(len(chart))
+    ticks = sorted({round(index * (len(chart) - 1) / 4) for index in range(5)})
+    labels = {str(index): chart["Hour"].iloc[index][5:] for index in ticks}
+    st.vega_lite_chart(chart, {
+        "height": height,
+        "mark": {"type": "line", "strokeWidth": 2},
+        "transform": [
+            {"fold": columns, "as": ["Metric", "Value"]},
+            {"filter": "isValid(datum.Value)"},
+        ],
+        "encoding": {
+            "x": {"field": "Hour index", "type": "quantitative", "title": "Collection hour (Chicago)",
+                  "scale": {"nice": False},
+                  "axis": {"values": ticks, "labelExpr": "(" + json.dumps(labels) + ")[datum.value]",
+                           "labelAngle": -25, "labelOverlap": True, "labelLimit": 120}},
+            "y": {"field": "Value", "type": "quantitative", "title": None, "scale": {"zero": True}},
+            "color": {"field": "Metric", "type": "nominal", "title": None,
+                      "scale": {"scheme": "tableau10"}, "legend": {"orient": "bottom"}},
+            "tooltip": [{"field": "Hour", "type": "nominal"},
+                        {"field": "Metric", "type": "nominal"},
+                        {"field": "Value", "type": "quantitative", "format": ".2f"}],
+        },
+    }, use_container_width=True)
+
 
 st.set_page_config(page_title="CTA Pipeline Monitor", page_icon="🚇", layout="wide")
 st.title("CTA Pipeline Monitor")
@@ -27,6 +62,7 @@ if not os.getenv("DATABASE_URL"):
     st.stop()
 
 if st.button("Refresh health data"):
+    validation_history.clear()
     st.rerun()
 
 try:
@@ -61,6 +97,45 @@ st.caption(
     "Recent updates count manifest-record updates, not confirmed collector runs; "
     "recovery or reconciliation can also update records."
 )
+
+st.subheader("Historical data checks")
+try:
+    quality = validation_history()
+except Exception as exc:
+    st.warning(f"Historical data checks unavailable ({type(exc).__name__}).")
+else:
+    if quality.empty:
+        st.info("No historical snapshots available.")
+    else:
+        total_snapshots, invalid_rows, mismatches, unknown_flags = st.columns(4)
+        total_snapshots.metric("Historical snapshots", f"{quality['Snapshots'].sum():,}")
+        invalid_rows.metric("Invalid prediction rows", f"{quality['Invalid prediction rows'].sum():,}")
+        mismatches.metric("Manifest mismatches", f"{quality['Manifest mismatches'].sum():,}")
+        unknown_flags.metric("Unknown delay flags", f"{quality['Unknown delay flags'].sum():,}")
+        st.caption("Source hours: America/Chicago. Nominal cadence: 12 snapshots per station per hour. Coverage excludes partial boundary hours.")
+        coverage, consistency, source_fields = st.tabs(["Coverage", "Consistency", "Source fields"])
+        with coverage:
+            st.write("Snapshots collected versus nominal cadence")
+            plot_history(quality, ["Snapshots", "Nominal snapshots"], height=280)
+            st.write("Hourly coverage and prediction volume")
+            coverage_percent, prediction_volume = st.columns(2)
+            with coverage_percent:
+                plot_history(quality, "Coverage (%)", height=240)
+            with prediction_volume:
+                plot_history(quality, "Predictions", height=240)
+        with consistency:
+            st.write("Required fields, timing and numeric-range violations")
+            plot_history(quality, "Invalid prediction rows")
+            st.write("File processing and manifest reconciliation")
+            plot_history(quality, ["Manifest mismatches", "Unprocessed files"])
+        with source_fields:
+            st.write("API-reported delays and unknown flags")
+            plot_history(quality, ["Reported delayed (%)", "Unknown delay (%)"])
+            st.write("Missing and zero-valued source coordinates")
+            plot_history(quality, ["Missing GPS (%)", "Zero GPS (%)"])
+        st.caption("Predictions are forecasts, not observed arrivals. Missing coordinates and unknown flags are retained; source fidelity does not prove forecast accuracy.")
+        with st.expander("Hourly data"):
+            st.dataframe(quality, use_container_width=True, hide_index=True)
 
 st.subheader("Manifest snapshot files by collection hour")
 st.caption(

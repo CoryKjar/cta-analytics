@@ -52,6 +52,8 @@ The scheduled collector, recovery and monitor entry points are unchanged. Collec
 
 Production schedules are collection and health checks every five minutes, with recovery hourly. Keep `SELF_HEAL_ENABLED=false` for ordinary collection when recovery is scheduled separately.
 
+The dashboard includes historical coverage, prediction volume, consistency violations, delay flags and coordinate-quality plots. Historical queries use a read-only consistent snapshot and cache results for five minutes; Refresh clears the cache. Empty station responses count toward coverage. Nominal coverage assumes 12 snapshots per configured station per full hour; partial boundary hours are excluded. Missing hours remain visible, unknown delay flags are not treated as false, and Chicago hour labels distinguish DST offsets. These plots show completeness and internal consistency, not proof that API forecasts match actual arrivals.
+
 ## Tests
 
 ```powershell
