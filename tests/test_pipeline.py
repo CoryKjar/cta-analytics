@@ -11,7 +11,7 @@ import pandas as pd
 from botocore.exceptions import ClientError
 
 from src.pipeline import main
-from src.ingestion.fetch_arrivals import fetch_arrivals
+from src.ingestion.fetch_arrivals import fetch_arrivals, fetch_cta_response
 from src.transform.parse_arrivals import parse_arrivals
 from src.storage.object_storage import storage_error_details
 from src.storage.self_heal import run_self_heal
@@ -31,10 +31,31 @@ class PipelineImportTests(unittest.TestCase):
 
 
 class FetchResponseValidationTests(unittest.TestCase):
+    @patch("src.ingestion.fetch_arrivals.time.sleep")
+    @patch("src.ingestion.fetch_arrivals.requests.get")
+    @patch("src.ingestion.fetch_arrivals.logger")
+    def test_request_retry_reports_attempt_numbers(self, logger, get, sleep):
+        retry_response = MagicMock(status_code=503, headers={"Retry-After": "1"})
+        success_response = MagicMock(status_code=200)
+        get.side_effect = [retry_response, success_response]
+        attempts = []
+
+        result = fetch_cta_response(
+            "https://example.invalid/arrivals", {"mapid": 40540}, "Wilson",
+            run_id="run-123", on_attempt=attempts.append,
+        )
+
+        self.assertIs(result, success_response)
+        self.assertEqual(attempts, [1, 2])
+        self.assertIn("run_id=%s", logger.warning.call_args.args[0])
+        sleep.assert_called_once_with(1.0)
+
+    @patch("src.ingestion.fetch_arrivals.CollectionAttemptLedger")
     @patch("src.ingestion.fetch_arrivals.logger")
     @patch("src.ingestion.fetch_arrivals.upload_file")
     @patch("src.ingestion.fetch_arrivals.fetch_cta_response")
-    def test_api_errors_are_not_written_or_uploaded(self, fetch, upload, logger):
+    def test_api_errors_are_not_written_or_uploaded(self, fetch, upload, logger, ledger_class):
+        ledger_class.return_value.run_id = "test-run"
         for code in ("100", "", "invalid"):
             fetch.return_value.text = (
                 f"<ctatt><tmst>20261016 16:21:19</tmst><errCd>{code}</errCd>"
@@ -47,13 +68,17 @@ class FetchResponseValidationTests(unittest.TestCase):
                         patch("src.ingestion.fetch_arrivals.Path", return_value=Path(directory)):
                     self.assertEqual(fetch_arrivals(), [])
                 self.assertEqual(list(Path(directory).iterdir()), [])
+                ledger_class.return_value.station_failed.assert_called()
+                self.assertEqual(ledger_class.return_value.station_failed.call_args.kwargs["stage"], "response_validation")
         upload.assert_not_called()
         self.assertNotIn("sensitive-source-detail", str(logger.error.call_args_list))
 
+    @patch("src.ingestion.fetch_arrivals.CollectionAttemptLedger")
     @patch("src.ingestion.fetch_arrivals.logger")
     @patch("src.ingestion.fetch_arrivals.upload_file")
     @patch("src.ingestion.fetch_arrivals.fetch_cta_response")
-    def test_successful_empty_response_is_uploaded_and_parseable(self, fetch, upload, logger):
+    def test_successful_empty_response_is_uploaded_and_parseable(self, fetch, upload, logger, ledger_class):
+        ledger_class.return_value.run_id = "test-run"
         fetch.return_value.text = "<ctatt><tmst>20261016 16:21:19</tmst><errCd>0</errCd></ctatt>"
         fetch.return_value.status_code = 200
         with tempfile.TemporaryDirectory() as directory:
@@ -66,6 +91,32 @@ class FetchResponseValidationTests(unittest.TestCase):
             self.assertEqual(uploaded, [expected])
             self.assertTrue(parse_arrivals(expected).empty)
             upload.assert_called_once_with(expected, "raw/2026/10/16/20261016_162119_Wilson.xml")
+            ledger_class.return_value.station_uploaded.assert_called_once()
+            ledger_class.return_value.finish.assert_called_once_with(
+                uploaded_count=1, failed_count=0, fatal_error_type=None,
+            )
+
+    @patch("src.ingestion.fetch_arrivals.CollectionAttemptLedger")
+    @patch("src.ingestion.fetch_arrivals.logger")
+    @patch("src.ingestion.fetch_arrivals.upload_file", side_effect=RuntimeError("private storage detail"))
+    @patch("src.ingestion.fetch_arrivals.fetch_cta_response")
+    def test_upload_failure_records_safe_bucket_stage_and_object(self, fetch, upload, logger, ledger_class):
+        ledger_class.return_value.run_id = "test-run"
+        fetch.return_value.text = "<ctatt><tmst>20261016 16:21:19</tmst><errCd>0</errCd></ctatt>"
+        fetch.return_value.status_code = 200
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.dict(os.environ, {"CTA_API_KEY": "test-key"}), \
+                    patch("src.ingestion.fetch_arrivals.load_dotenv"), \
+                    patch("src.ingestion.fetch_arrivals.STATIONS", {"Wilson": 40540}), \
+                    patch("src.ingestion.fetch_arrivals.Path", return_value=Path(directory)):
+                self.assertEqual(fetch_arrivals(), [])
+
+        failure = ledger_class.return_value.station_failed.call_args.kwargs
+        self.assertEqual(failure["stage"], "bucket_upload")
+        self.assertEqual(failure["http_status"], 200)
+        self.assertEqual(failure["source_file"], "20261016_162119_Wilson.xml")
+        self.assertEqual(failure["object_key"], "raw/2026/10/16/20261016_162119_Wilson.xml")
+        self.assertNotIn("private storage detail", str(logger.error.call_args_list))
 
 
 class RecoveryLoggingTests(unittest.TestCase):

@@ -13,7 +13,9 @@ class StationFreshnessTests(unittest.TestCase):
         conn = connect.return_value.__enter__.return_value
         def execute(query, parameters=None):
             cursor = MagicMock()
-            if "GROUP BY station_id" in query:
+            if "to_regclass('public.collection_runs')" in query:
+                cursor.fetchone.return_value = (None,)
+            elif "GROUP BY station_id" in query:
                 cursor.fetchall.return_value = [(1, now)]
             elif "MAX(collection_timestamp" in query:
                 cursor.fetchone.return_value = (now,)
@@ -28,6 +30,41 @@ class StationFreshnessTests(unittest.TestCase):
         self.assertEqual(health["stale_stations"], ["Missing"])
         self.assertIn("station_collection_stale", health["issues"])
         self.assertNotIn("collection_stale", health["issues"])
+        self.assertEqual(health["stale_collection_runs"], [])
+        self.assertNotIn("partial_collection_run", health["issues"])
+
+    @patch("src.monitoring.health_check.STATIONS", {"Station": 1})
+    @patch("src.monitoring.health_check.connect")
+    def test_stale_and_partial_collection_runs_are_reported(self, connect):
+        now = datetime.now(timezone.utc)
+        conn = connect.return_value.__enter__.return_value
+
+        def execute(query, parameters=None):
+            cursor = MagicMock()
+            if "to_regclass('public.collection_runs')" in query:
+                cursor.fetchone.return_value = ("collection_runs",)
+            elif "FROM public.collection_runs AS r" in query:
+                cursor.fetchall.return_value = [("stale-run-1234", now - timedelta(minutes=20), 143, 58, 1, 84)]
+            elif "FROM public.collection_runs" in query:
+                cursor.fetchall.return_value = [("partial-run-5678", now - timedelta(minutes=4), "partial", 143, 58, 85, None)]
+            elif "GROUP BY station_id" in query:
+                cursor.fetchall.return_value = [(1, now)]
+            elif "MAX(collection_timestamp" in query:
+                cursor.fetchone.return_value = (now,)
+            elif "GROUP BY status" in query:
+                cursor.fetchall.return_value = [("processed", 10)]
+            else:
+                cursor.fetchone.return_value = (0,)
+                cursor.fetchall.return_value = []
+            return cursor
+
+        conn.execute.side_effect = execute
+        health = collect_health()
+
+        self.assertIn("collection_run_incomplete", health["issues"])
+        self.assertIn("partial_collection_run", health["issues"])
+        self.assertIn("stale-ru", health["issues"]["collection_run_incomplete"])
+        self.assertIn("58/143 uploaded", health["issues"]["partial_collection_run"])
 
 
 class HealthLoggingTests(unittest.TestCase):
@@ -61,7 +98,9 @@ class HealthLoggingTests(unittest.TestCase):
         connect.return_value.__enter__.return_value.execute.return_value.fetchone.return_value = ("",)
         evaluate_and_alert()
         send.assert_called_once()
+        self.assertIn("Latest snapshot is stale", send.call_args.args[1])
         self.assertIn("event=health_issue", logger.error.call_args_list[0].args[0])
+        self.assertIn("detail=%s", logger.error.call_args_list[0].args[0])
         self.assertIn("event=health_check_completed", logger.error.call_args.args[0])
         self.assertTrue(any("event=health_email_sent" in call.args[0] for call in logger.info.call_args_list))
 

@@ -23,6 +23,8 @@ logger = get_logger(__name__)
 
 STALE_MINUTES = int(os.getenv("COLLECTION_STALE_MINUTES", "15"))
 MAX_ATTEMPTS = int(os.getenv("SELF_HEAL_MAX_ATTEMPTS", "5"))
+COLLECTION_RUN_STALE_MINUTES = int(os.getenv("COLLECTION_RUN_STALE_MINUTES", "15"))
+COLLECTION_RUN_STALE_MINUTES = int(os.getenv("COLLECTION_RUN_STALE_MINUTES", "15"))
 
 
 def connect():
@@ -87,6 +89,64 @@ def collect_health():
             FROM ingestion_files WHERE status='processed' AND station_id IS NOT NULL
             GROUP BY station_id
         """).fetchall())
+
+        ledger_relation = conn.execute(
+            "SELECT to_regclass('public.collection_runs')"
+        ).fetchone()[0]
+        stale_collection_runs = []
+        recent_partial_collection_runs = []
+        if ledger_relation is not None:
+            stale_collection_runs = conn.execute("""
+                SELECT r.run_id::text, r.started_at, r.expected_station_count,
+                       COUNT(*) FILTER (WHERE a.status = 'uploaded')::bigint AS uploaded,
+                       COUNT(*) FILTER (WHERE a.status = 'failed')::bigint AS failed,
+                       COUNT(*) FILTER (WHERE a.status IN ('pending', 'in_progress'))::bigint AS unfinished
+                FROM public.collection_runs AS r
+                LEFT JOIN public.collection_attempts AS a USING (run_id)
+                WHERE r.status = 'running'
+                  AND r.started_at < NOW() - (%s * INTERVAL '1 minute')
+                GROUP BY r.run_id
+                ORDER BY r.started_at DESC
+                LIMIT 10
+            """, (COLLECTION_RUN_STALE_MINUTES,)).fetchall()
+            recent_partial_collection_runs = conn.execute("""
+                SELECT run_id::text, started_at, status, expected_station_count,
+                      uploaded_station_count, failed_station_count, fatal_error_type
+                FROM public.collection_runs
+                WHERE status IN ('partial', 'failed')
+                  AND completed_at >= NOW() - (%s * INTERVAL '1 minute')
+                ORDER BY completed_at DESC
+                LIMIT 10
+            """, (COLLECTION_RUN_STALE_MINUTES,)).fetchall()
+
+        has_collection_ledger = conn.execute(
+            "SELECT to_regclass('public.collection_runs')"
+        ).fetchone()[0] is not None
+        stale_collection_runs = []
+        recent_partial_collection_runs = []
+        if has_collection_ledger:
+            stale_collection_runs = conn.execute("""
+                SELECT r.run_id::text, r.started_at, r.expected_station_count,
+                       COUNT(*) FILTER (WHERE a.status = 'uploaded')::bigint AS uploaded,
+                       COUNT(*) FILTER (WHERE a.status = 'failed')::bigint AS failed,
+                       COUNT(*) FILTER (WHERE a.status IN ('pending', 'in_progress'))::bigint AS unfinished
+                FROM public.collection_runs AS r
+                LEFT JOIN public.collection_attempts AS a USING (run_id)
+                WHERE r.status = 'running'
+                  AND r.started_at < NOW() - (%s * INTERVAL '1 minute')
+                GROUP BY r.run_id
+                ORDER BY r.started_at DESC
+                LIMIT 10
+            """, (COLLECTION_RUN_STALE_MINUTES,)).fetchall()
+            recent_partial_collection_runs = conn.execute("""
+                SELECT run_id::text, started_at, status, expected_station_count,
+                       uploaded_station_count, failed_station_count
+                FROM public.collection_runs
+                WHERE status IN ('partial', 'failed')
+                  AND completed_at >= NOW() - INTERVAL '15 minutes'
+                ORDER BY completed_at DESC
+                LIMIT 10
+            """).fetchall()
 
     now = datetime.now(timezone.utc)
     age_minutes = None
@@ -155,7 +215,20 @@ def collect_health():
         issues["row_count_mismatch"] = (
             f"{mismatch_count} processed manifest row-count mismatch(es)."
         )
-
+    if stale_collection_runs:
+        run_id, started_at, expected, uploaded, failed, unfinished = stale_collection_runs[0]
+        issues["collection_run_incomplete"] = (
+            f"Run {run_id[:8]} started at {started_at.isoformat()} is still running after "
+            f"{COLLECTION_RUN_STALE_MINUTES} minutes: {uploaded}/{expected} uploaded, "
+            f"{failed} failed, {unfinished} pending/in progress."
+        )
+    if recent_partial_collection_runs:
+        run_id, started_at, status, expected, uploaded, failed, fatal_error_type = recent_partial_collection_runs[0]
+        fatal_detail = f", fatal error {fatal_error_type}" if fatal_error_type else ""
+        issues["partial_collection_run"] = (
+            f"Run {run_id[:8]} at {started_at.isoformat()} ended {status}: "
+            f"{uploaded}/{expected} uploaded, {failed} failed{fatal_detail}."
+        )
     return {
         "checked_at": now,
         "latest_snapshot": latest,
@@ -164,6 +237,8 @@ def collect_health():
         "retry_rows": retry_rows,
         "nonprocessed_rows": nonprocessed,
         "mismatch_count": mismatch_count,
+        "stale_collection_runs": stale_collection_runs,
+        "recent_partial_collection_runs": recent_partial_collection_runs,
         "recent_updates": recent_updates,
         "issues": issues,
         "stale_stations": stale_stations,
@@ -209,11 +284,12 @@ def evaluate_and_alert():
 
 def _evaluate_and_alert():
     health = collect_health()
-    for key in health["issues"]:
-        logger.error("event=health_issue issue=%s", key)
+    for key, detail in sorted(health["issues"].items()):
+        logger.error("event=health_issue issue=%s detail=%s", key, detail)
     issue_items = sorted(health["issues"].items())
     # Deduplicate by issue type, not changing counts/ages, to avoid alert spam.
     current_signature = "\n".join(k for k, _ in issue_items)
+    issue_details = "\n".join(f"{key}: {detail}" for key, detail in issue_items)
     state_key = "pipeline_health"
 
     # State is stored in a dedicated monitoring table, not in ingestion_files.
@@ -230,7 +306,7 @@ def _evaluate_and_alert():
                 subject = "[CTA ALERT] Pipeline health issue"
                 body = (
                     f"CTA pipeline health check at {health['checked_at'].isoformat()}\n\n"
-                    + current_signature
+                    + issue_details
                     + f"\n\nLatest processed snapshot: {health['latest_snapshot']}\n"
                     + f"Processed files updated in last 15 minutes: {health['recent_updates']}\n"
                 )
