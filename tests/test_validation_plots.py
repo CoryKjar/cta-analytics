@@ -138,6 +138,7 @@ class ValidationHistoryTests(unittest.TestCase):
                 ("legacy.xml", "failed", 1, "private error with token=secret", pd.Timestamp("2026-10-06T06:00Z")),
             ],
             "has_collection_ledger": True,
+            "has_collection_retry_details": True,
             "recent_collection_runs": [(
                 "run-12345678", pd.Timestamp("2026-10-06T06:00Z"),
                 pd.Timestamp("2026-10-06T06:01Z"), "partial", 143, 142, 1,
@@ -148,6 +149,7 @@ class ValidationHistoryTests(unittest.TestCase):
                 "Wilson", 40540, 143, "failed", "bucket_upload", 1, 200,
                 None, "AccessDenied", 403, "ClientError",
                 "snapshot.xml", "raw/2026/10/06/snapshot.xml", 0.5,
+                503, "HTTPError",
             )],
         }
         with patch.dict("os.environ", {"DATABASE_URL": "unused"}), \
@@ -184,6 +186,8 @@ class ValidationHistoryTests(unittest.TestCase):
             attempt_logs = [item.value for item in app.dataframe if "Request attempts" in item.value.columns]
             self.assertEqual(attempt_logs[0]["Storage error"].tolist(), ["AccessDenied"])
             self.assertEqual(attempt_logs[0]["Stage"].tolist(), ["bucket_upload"])
+            self.assertEqual(attempt_logs[0]["Last retry HTTP status"].tolist(), [503])
+            self.assertEqual(attempt_logs[0]["Last retry error type"].tolist(), ["HTTPError"])
             health["recent_collection_runs"] = []
             health["collection_attempt_logs"] = []
             for label, hours, period in (
@@ -201,6 +205,13 @@ class ValidationHistoryTests(unittest.TestCase):
                     )
                     self.assertFalse(any("below nominal" in item.value for item in app.warning))
                     self.assertFalse(any("Below nominal" in item.value.columns for item in app.dataframe))
+            health["has_collection_retry_details"] = False
+            app.run(timeout=30)
+            self.assertFalse(app.exception)
+            self.assertIn(
+                "Retry failure details require the collection retry-context migration.",
+                [item.value for item in app.info],
+            )
             health["has_collection_ledger"] = False
             app.run(timeout=30)
             self.assertTrue(any("Failed attempts" in item.value.columns for item in app.dataframe))

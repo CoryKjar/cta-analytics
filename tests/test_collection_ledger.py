@@ -8,6 +8,58 @@ from src.storage.collection_ledger import CollectionAttemptLedger
 class CollectionAttemptLedgerTests(unittest.TestCase):
     @patch("src.storage.collection_ledger.psycopg.connect")
     @patch("src.storage.collection_ledger.os.getenv")
+    def test_retry_reason_survives_successful_upload(self, getenv, connect):
+        getenv.side_effect = lambda key, default=None: "unused" if key == "DATABASE_URL" else default
+        connection = connect.return_value
+        connection.execute.return_value.fetchone.return_value = (2,)
+        cursor = connection.cursor.return_value.__enter__.return_value
+        ledger = CollectionAttemptLedger({"Wilson": 40540}, MagicMock())
+        ledger.record_retry_failure(40540, http_status=503, error_type="HTTPError")
+        retry_call = cursor.execute.call_args
+        self.assertIn("last_retry_http_status=%s", retry_call.args[0])
+        self.assertEqual(retry_call.args[1], (503, "HTTPError", ledger.run_id, 40540))
+        ledger.station_uploaded(
+            40540, attempt_count=2, http_status=200, cta_error_code="0",
+            source_file="snapshot.xml", object_key="raw/snapshot.xml", duration_seconds=1,
+        )
+        self.assertNotIn("last_retry_http_status", cursor.execute.call_args.args[0])
+        self.assertNotIn("last_retry_error_type", cursor.execute.call_args.args[0])
+
+    @patch("src.storage.collection_ledger.psycopg.connect")
+    @patch("src.storage.collection_ledger.os.getenv")
+    def test_missing_retry_migration_keeps_existing_ledger_enabled(self, getenv, connect):
+        getenv.side_effect = lambda key, default=None: "unused" if key == "DATABASE_URL" else default
+        connection = connect.return_value
+        connection.execute.return_value.fetchone.return_value = (0,)
+        logger = MagicMock()
+        ledger = CollectionAttemptLedger({"Wilson": 40540}, logger)
+        cursor = connection.cursor.return_value.__enter__.return_value
+        previous_calls = cursor.execute.call_count
+        ledger.record_retry_failure(40540, http_status=503, error_type="HTTPError")
+        self.assertEqual(cursor.execute.call_count, previous_calls)
+        self.assertTrue(ledger.enabled)
+        logger.warning.assert_called_once()
+
+    @patch("src.storage.collection_ledger.psycopg.connect")
+    @patch("src.storage.collection_ledger.os.getenv")
+    def test_failed_finish_commit_never_logs_completion(self, getenv, connect):
+        getenv.side_effect = lambda key, default=None: "unused" if key == "DATABASE_URL" else default
+        for successful_finish_commits in (0, 1):
+            with self.subTest(successful_finish_commits=successful_finish_commits):
+                connection = MagicMock()
+                connect.return_value = connection
+                logger = MagicMock()
+                ledger = CollectionAttemptLedger({"Wilson": 40540}, logger)
+                logger.reset_mock()
+                connection.commit.side_effect = [None] * successful_finish_commits + [RuntimeError("private detail")]
+                ledger.finish(uploaded_count=1, failed_count=0)
+                self.assertFalse(ledger.enabled)
+                logger.info.assert_not_called()
+                logger.error.assert_called_once()
+                self.assertNotIn("private", str(logger.mock_calls))
+
+    @patch("src.storage.collection_ledger.psycopg.connect")
+    @patch("src.storage.collection_ledger.os.getenv")
     def test_registers_expected_stations_before_collection(self, getenv, connect):
         getenv.side_effect = lambda key, default=None: {
             "DATABASE_URL": "unused",

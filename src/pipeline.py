@@ -21,6 +21,16 @@ def _timestamp_from_path(path):
     return datetime.strptime(f"{parts[0]}_{parts[1]}", "%Y%m%d_%H%M%S")
 
 
+def _register_failures(records):
+    try:
+        register_file_results(records)
+    except Exception as exc:
+        logger.error(
+            "event=file_failure_registration_failed files=%s error_type=%s",
+            len(records), type(exc).__name__,
+        )
+
+
 def main():
     started = time.monotonic()
     logger.info("event=pipeline_started")
@@ -71,24 +81,47 @@ def main():
             })
             logger.error("event=file_parse_failed file=%r error_type=%s", path.name, type(exc).__name__)
 
+    if parse_failures:
+        _register_failures(parse_failures)
+        logger.warning("event=parse_failures_detected files=%s", len(parse_failures))
+
     successfully_loaded_files = set()
     loaded_rows = 0
     if parsed_frames:
         all_rows = pd.concat(parsed_frames, ignore_index=True)
         loaded_rows = len(all_rows)
-        load_arrivals_data(all_rows)
+        try:
+            load_arrivals_data(all_rows)
+        except Exception as exc:
+            failures = []
+            for name in all_rows["source_file"].unique():
+                failures.append({
+                    "source_file": name,
+                    "collection_timestamp": _timestamp_from_path(name),
+                    "station_id": None, "status": "failed", "row_count": 0,
+                    "last_error": f"load: {type(exc).__name__}",
+                })
+                logger.error("event=file_load_failed file=%r error_type=%s", name, type(exc).__name__)
+            _register_failures(failures)
+            raise
         successfully_loaded_files = set(all_rows["source_file"].unique())
         logger.info("event=database_load_succeeded files=%s arrival_rows=%s", len(successfully_loaded_files), loaded_rows)
 
     successfully_empty_files = set()
     if empty_files:
-        register_file_results(empty_files)
+        try:
+            register_file_results(empty_files)
+        except Exception as exc:
+            failures = [
+                {**item, "status": "failed", "last_error": f"empty-file registration: {type(exc).__name__}"}
+                for item in empty_files
+            ]
+            for item in failures:
+                logger.error("event=empty_file_registration_failed file=%r error_type=%s", item["source_file"], type(exc).__name__)
+            _register_failures(failures)
+            raise
         successfully_empty_files = {item["source_file"] for item in empty_files}
         logger.info("event=zero_arrival_files_registered files=%s", len(successfully_empty_files))
-
-    if parse_failures:
-        register_file_results(parse_failures)
-        logger.warning("event=parse_failures_registered files=%s", len(parse_failures))
 
     safe_to_archive = [
         path for path in fetched_files

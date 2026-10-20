@@ -352,6 +352,8 @@ with quality_tab:
         if not health.get("has_collection_ledger", False):
             st.info("Collection-attempt logging is not installed in this database. Apply the collection ledger migration to enable it.")
         else:
+            if not health.get("has_collection_retry_details", False):
+                st.info("Retry failure details require the collection retry-context migration.")
             run_rows = health.get("recent_collection_runs", [])
             if run_rows:
                 run_frame = pd.DataFrame(run_rows, columns=[
@@ -376,6 +378,7 @@ with quality_tab:
                     "Status", "Stage", "Request attempts", "HTTP status", "CTA error code",
                     "Storage error", "Storage HTTP status", "Error type", "Source file",
                     "Bucket key", "Duration (s)",
+                    "Last retry HTTP status", "Last retry error type",
                 ])
                 attempt_frame["Run ID"] = attempt_frame["Run ID"].str.slice(0, 8)
                 run_started = pd.to_datetime(attempt_frame["Run started"], utc=True, errors="coerce")

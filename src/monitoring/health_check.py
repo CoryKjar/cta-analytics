@@ -16,6 +16,7 @@ from zoneinfo import ZoneInfo
 import psycopg
 from dotenv import load_dotenv
 from src.config.stations import STATIONS
+from src.storage.collection_ledger import collection_retry_details_available
 from src.utils.logger import get_logger
 
 load_dotenv()
@@ -23,7 +24,6 @@ logger = get_logger(__name__)
 
 STALE_MINUTES = int(os.getenv("COLLECTION_STALE_MINUTES", "15"))
 MAX_ATTEMPTS = int(os.getenv("SELF_HEAL_MAX_ATTEMPTS", "5"))
-COLLECTION_RUN_STALE_MINUTES = int(os.getenv("COLLECTION_RUN_STALE_MINUTES", "15"))
 COLLECTION_RUN_STALE_MINUTES = int(os.getenv("COLLECTION_RUN_STALE_MINUTES", "15"))
 
 
@@ -107,7 +107,13 @@ def collect_health(*, collection_window_hours=24):
         recent_partial_collection_runs = []
         recent_collection_runs = []
         collection_attempt_logs = []
+        has_collection_retry_details = False
         if has_collection_ledger:
+            has_collection_retry_details = collection_retry_details_available(conn)
+            retry_columns = (
+                "a.last_retry_http_status, a.last_retry_error_type"
+                if has_collection_retry_details else "NULL::integer, NULL::text"
+            )
             stale_collection_runs = conn.execute("""
                 SELECT r.run_id::text, r.started_at, r.expected_station_count,
                        COUNT(*) FILTER (WHERE a.status = 'uploaded')::bigint AS uploaded,
@@ -130,19 +136,12 @@ def collect_health(*, collection_window_hours=24):
                 ORDER BY completed_at DESC
                 LIMIT 10
             """, (COLLECTION_RUN_STALE_MINUTES,)).fetchall()
-            recent_partial_collection_runs = conn.execute("""
-                SELECT run_id::text, started_at, status, expected_station_count,
-                       uploaded_station_count, failed_station_count, fatal_error_type
-                FROM public.collection_runs
-                WHERE status IN ('partial', 'failed')
-                  AND completed_at >= NOW() - INTERVAL '24 hours'
-                ORDER BY completed_at DESC
-                LIMIT 20
-            """).fetchall()
             recent_collection_runs = conn.execute("""
                 SELECT r.run_id::text, r.started_at, r.completed_at, r.status,
-                       r.expected_station_count, r.uploaded_station_count,
-                       r.failed_station_count, r.fatal_error_type,
+                                             r.expected_station_count,
+                                             COUNT(*) FILTER (WHERE a.status = 'uploaded')::bigint AS uploaded,
+                                             COUNT(*) FILTER (WHERE a.status = 'failed')::bigint AS failed,
+                                             r.fatal_error_type,
                        COUNT(*) FILTER (WHERE a.status = 'pending')::bigint AS pending,
                        COUNT(*) FILTER (WHERE a.status = 'in_progress')::bigint AS in_progress
                 FROM public.collection_runs AS r
@@ -152,19 +151,19 @@ def collect_health(*, collection_window_hours=24):
                 ORDER BY r.started_at DESC
                 LIMIT 20
             """, (collection_window_hours, collection_window_hours)).fetchall()
-            collection_attempt_logs = conn.execute("""
+            collection_attempt_logs = conn.execute(f"""
                 SELECT r.run_id::text, r.started_at, a.station_name, a.station_id,
                        a.station_index, a.status, a.stage, a.request_attempts,
                        a.http_status, a.cta_error_code, a.storage_error_code,
                        a.storage_http_status, a.error_type, a.source_file,
-                       a.object_key, a.duration_seconds
+                       a.object_key, a.duration_seconds, {retry_columns}
                 FROM public.collection_attempts AS a
                 JOIN public.collection_runs AS r USING (run_id)
-                                WHERE (%s::integer IS NULL OR r.started_at >= NOW() - (%s * INTERVAL '1 hour'))
+                WHERE (%s::integer IS NULL OR r.started_at >= NOW() - (%s * INTERVAL '1 hour'))
                   AND (a.status <> 'uploaded' OR a.request_attempts > 1)
                 ORDER BY r.started_at DESC, a.station_index
                 LIMIT 100
-                        """, (collection_window_hours, collection_window_hours)).fetchall()
+            """, (collection_window_hours, collection_window_hours)).fetchall()
 
     now = datetime.now(timezone.utc)
     age_minutes = None
@@ -259,6 +258,7 @@ def collect_health(*, collection_window_hours=24):
         "stale_collection_runs": stale_collection_runs,
         "recent_partial_collection_runs": recent_partial_collection_runs,
         "has_collection_ledger": has_collection_ledger,
+        "has_collection_retry_details": has_collection_retry_details,
         "recent_collection_runs": recent_collection_runs,
         "collection_attempt_logs": collection_attempt_logs,
         "recent_updates": recent_updates,

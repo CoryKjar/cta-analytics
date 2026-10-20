@@ -24,7 +24,7 @@ def _record_request_attempt(ledger, station_id, counter, attempt):
         ledger.record_request_attempt(station_id, attempt)
 
 
-def fetch_cta_response(url, params, station_name, max_attempts=3, *, run_id=None, on_attempt=None):
+def fetch_cta_response(url, params, station_name, max_attempts=3, *, run_id=None, on_attempt=None, on_retry=None):
     """Fetch a station response with bounded retries and safe logging."""
     for attempt in range(1, max_attempts + 1):
         if on_attempt is not None:
@@ -41,6 +41,8 @@ def fetch_cta_response(url, params, station_name, max_attempts=3, *, run_id=None
                     delay = 0
                 if delay <= 0:
                     delay = min(2 ** (attempt - 1) + random.uniform(0, 1), 15)
+                if on_retry is not None:
+                    on_retry(http_status=response.status_code, error_type="HTTPError")
                 logger.warning(
                     "event=cta_retry run_id=%s station=%s http_status=%s attempt=%s/%s delay_seconds=%.1f",
                     run_id, station_name, response.status_code, attempt, max_attempts, delay,
@@ -57,6 +59,8 @@ def fetch_cta_response(url, params, station_name, max_attempts=3, *, run_id=None
                 )
                 raise
             delay = min(2 ** (attempt - 1) + random.uniform(0, 1), 15)
+            if on_retry is not None:
+                on_retry(http_status=None, error_type=type(exc).__name__)
             logger.warning(
                 "event=cta_retry run_id=%s station=%s error_type=%s attempt=%s/%s delay_seconds=%.1f",
                 run_id, station_name, type(exc).__name__, attempt, max_attempts, delay,
@@ -100,6 +104,7 @@ def fetch_arrivals():
                     on_attempt=lambda attempt: _record_request_attempt(
                         ledger, map_id, request_attempts, attempt,
                     ),
+                    on_retry=lambda **details: ledger.record_retry_failure(map_id, **details),
                 )
                 http_status = response.status_code
                 stage = "response_parse"

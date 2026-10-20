@@ -2,7 +2,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
-from src.monitoring.health_check import collect_health, evaluate_and_alert
+from src.monitoring.health_check import COLLECTION_RUN_STALE_MINUTES, collect_health, evaluate_and_alert
 
 
 class StationFreshnessTests(unittest.TestCase):
@@ -38,11 +38,19 @@ class StationFreshnessTests(unittest.TestCase):
     def test_stale_and_partial_collection_runs_are_reported(self, connect):
         now = datetime.now(timezone.utc)
         conn = connect.return_value.__enter__.return_value
+        retry_column_count = 0
 
         def execute(query, parameters=None):
             cursor = MagicMock()
             if "to_regclass('public.collection_runs')" in query:
                 cursor.fetchone.return_value = ("collection_runs",)
+            elif "information_schema.columns" in query:
+                cursor.fetchone.return_value = (retry_column_count,)
+            elif "FROM public.collection_runs AS r" in query and "LIMIT 20" in query:
+                cursor.fetchall.return_value = [(
+                    "stale-run-1234", now - timedelta(minutes=20), None, "running",
+                    143, 58, 1, None, 83, 1,
+                )]
             elif "FROM public.collection_runs AS r" in query:
                 cursor.fetchall.return_value = [("stale-run-1234", now - timedelta(minutes=20), 143, 58, 1, 84)]
             elif "FROM public.collection_runs" in query:
@@ -59,8 +67,8 @@ class StationFreshnessTests(unittest.TestCase):
             return cursor
 
         conn.execute.side_effect = execute
-        for window_hours in (24, 720, None):
-            with self.subTest(window_hours=window_hours):
+        for window_hours, retry_column_count in ((24, 0), (720, 2), (None, 2), (None, 0)):
+            with self.subTest(window_hours=window_hours, retry_column_count=retry_column_count):
                 conn.execute.reset_mock()
                 health = collect_health(collection_window_hours=window_hours)
 
@@ -68,6 +76,8 @@ class StationFreshnessTests(unittest.TestCase):
                 self.assertIn("partial_collection_run", health["issues"])
                 self.assertIn("stale-ru", health["issues"]["collection_run_incomplete"])
                 self.assertIn("58/143 uploaded", health["issues"]["partial_collection_run"])
+                self.assertEqual(health["recent_collection_runs"][0][5:7], (58, 1))
+                self.assertEqual(health["has_collection_retry_details"], retry_column_count == 2)
                 log_calls = [call for call in conn.execute.call_args_list
                              if "%s::integer IS NULL" in call.args[0]]
                 self.assertEqual(len(log_calls), 3)
@@ -76,6 +86,22 @@ class StationFreshnessTests(unittest.TestCase):
                     self.assertNotIn("INTERVAL '24 hours'", call.args[0])
                 self.assertTrue(any("OR attempts > 0" in call.args[0] for call in log_calls))
                 self.assertTrue(any("OR a.request_attempts > 1" in call.args[0] for call in log_calls))
+                run_queries = [call.args[0] for call in log_calls if "GROUP BY r.run_id" in call.args[0]]
+                self.assertEqual(len(run_queries), 1)
+                self.assertIn("COUNT(*) FILTER (WHERE a.status = 'uploaded')", run_queries[0])
+                self.assertIn("COUNT(*) FILTER (WHERE a.status = 'failed')", run_queries[0])
+                self.assertNotIn("r.uploaded_station_count", run_queries[0])
+                attempt_query = next(call.args[0] for call in log_calls if "a.request_attempts > 1" in call.args[0])
+                if retry_column_count == 2:
+                    self.assertIn("a.last_retry_http_status, a.last_retry_error_type", attempt_query)
+                else:
+                    self.assertIn("NULL::integer, NULL::text", attempt_query)
+                    self.assertNotIn("a.last_retry_http_status", attempt_query)
+                partial_calls = [call for call in conn.execute.call_args_list
+                                 if "WHERE status IN ('partial', 'failed')" in call.args[0]]
+                self.assertEqual(len(partial_calls), 1)
+                self.assertEqual(partial_calls[0].args[1], (COLLECTION_RUN_STALE_MINUTES,))
+                self.assertNotIn("INTERVAL '24 hours'", partial_calls[0].args[0])
 
 
 class HealthLoggingTests(unittest.TestCase):

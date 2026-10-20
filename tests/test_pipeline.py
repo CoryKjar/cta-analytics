@@ -33,6 +33,46 @@ class PipelineImportTests(unittest.TestCase):
 class FetchResponseValidationTests(unittest.TestCase):
     @patch("src.ingestion.fetch_arrivals.time.sleep")
     @patch("src.ingestion.fetch_arrivals.requests.get")
+    @patch("src.ingestion.fetch_arrivals.CollectionAttemptLedger")
+    @patch("src.ingestion.fetch_arrivals.logger")
+    @patch("src.ingestion.fetch_arrivals.upload_file")
+    def test_collector_records_retry_reason_and_final_success_separately(self, upload, logger, ledger_class, get, sleep):
+        success = MagicMock(status_code=200)
+        success.text = "<ctatt><tmst>20261019 19:55:00</tmst><errCd>0</errCd></ctatt>"
+        get.side_effect = [MagicMock(status_code=503, headers={}), success]
+        ledger = ledger_class.return_value
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.dict(os.environ, {"CTA_API_KEY": "private-key"}), \
+                    patch("src.ingestion.fetch_arrivals.load_dotenv"), \
+                    patch("src.ingestion.fetch_arrivals.STATIONS", {"Wilson": 40540}), \
+                    patch("src.ingestion.fetch_arrivals.Path", return_value=Path(directory)):
+                self.assertEqual(len(fetch_arrivals()), 1)
+        ledger.record_retry_failure.assert_called_once_with(40540, http_status=503, error_type="HTTPError")
+        ledger.record_request_attempt.assert_called_once_with(40540, 2)
+        self.assertEqual(ledger.station_uploaded.call_args.kwargs["http_status"], 200)
+        self.assertEqual(ledger.station_uploaded.call_args.kwargs["attempt_count"], 2)
+        self.assertNotIn("private-key", str(logger.mock_calls) + str(ledger.mock_calls))
+
+    @patch("src.ingestion.fetch_arrivals.time.sleep")
+    @patch("src.ingestion.fetch_arrivals.requests.get")
+    @patch("src.ingestion.fetch_arrivals.logger")
+    def test_successful_request_preserves_safe_retry_context(self, logger, get, sleep):
+        from requests.exceptions import Timeout
+        for failure, expected in (
+            (MagicMock(status_code=503, headers={}), {"http_status": 503, "error_type": "HTTPError"}),
+            (Timeout("private request URL"), {"http_status": None, "error_type": "Timeout"}),
+        ):
+            with self.subTest(error_type=expected["error_type"]):
+                success = MagicMock(status_code=200)
+                get.side_effect = [failure, success]
+                retry = MagicMock()
+                result = fetch_cta_response("https://example.invalid", {}, "Wilson", on_retry=retry)
+                self.assertIs(result, success)
+                retry.assert_called_once_with(**expected)
+                self.assertNotIn("private", str(retry.mock_calls) + str(logger.mock_calls))
+
+    @patch("src.ingestion.fetch_arrivals.time.sleep")
+    @patch("src.ingestion.fetch_arrivals.requests.get")
     @patch("src.ingestion.fetch_arrivals.logger")
     def test_request_retry_reports_attempt_numbers(self, logger, get, sleep):
         retry_response = MagicMock(status_code=503, headers={"Retry-After": "1"})
@@ -201,6 +241,50 @@ class RecoveryLoggingTests(unittest.TestCase):
 
 
 class PipelineFailureTests(unittest.TestCase):
+    @patch("src.pipeline.logger")
+    @patch("src.pipeline.cleanup_staged_files")
+    @patch("src.pipeline.register_file_results")
+    @patch("src.pipeline.load_arrivals_data", side_effect=RuntimeError("private database URL"))
+    @patch("src.pipeline.parse_arrivals")
+    @patch("src.pipeline.fetch_arrivals")
+    def test_load_failure_preserves_parse_and_load_issue_records(self, fetch, parse, load, register, archive, logger):
+        fetch.return_value = ["20261019_195500_Wilson.xml", "20261019_195501_Loyola.xml"]
+        parse.side_effect = [ValueError("private XML"), pd.DataFrame({"source_file": [fetch.return_value[1]]})]
+        with patch.dict(os.environ, {"SELF_HEAL_ENABLED": "false"}):
+            with self.assertRaises(RuntimeError):
+                main()
+        self.assertEqual(register.call_count, 2)
+        records = [record for call in register.call_args_list for record in call.args[0]]
+        self.assertEqual([record["last_error"] for record in records], ["parse: ValueError", "load: RuntimeError"])
+        self.assertEqual([record["source_file"] for record in records], fetch.return_value)
+        archive.assert_not_called()
+        self.assertNotIn("private", str(register.mock_calls) + str(logger.mock_calls))
+
+    @patch("src.pipeline.logger")
+    @patch("src.pipeline.register_file_results", side_effect=ValueError("private registration error"))
+    @patch("src.pipeline.load_arrivals_data", side_effect=RuntimeError("original load failure"))
+    @patch("src.pipeline.parse_arrivals")
+    @patch("src.pipeline.fetch_arrivals", return_value=["20261019_195500_Wilson.xml"])
+    def test_failure_registration_does_not_mask_original_load_error(self, fetch, parse, load, register, logger):
+        parse.return_value = pd.DataFrame({"source_file": fetch.return_value})
+        with patch.dict(os.environ, {"SELF_HEAL_ENABLED": "false"}):
+            with self.assertRaisesRegex(RuntimeError, "original load failure"):
+                main()
+        self.assertNotIn("private", str(logger.mock_calls))
+
+    @patch("src.pipeline.logger")
+    @patch("src.pipeline.cleanup_staged_files")
+    @patch("src.pipeline.register_file_results", side_effect=[RuntimeError("private error"), None])
+    @patch("src.pipeline.parse_arrivals", return_value=pd.DataFrame())
+    @patch("src.pipeline.fetch_arrivals", return_value=["20261019_195500_Wilson.xml"])
+    def test_empty_registration_failure_is_recorded(self, fetch, parse, register, archive, logger):
+        with patch.dict(os.environ, {"SELF_HEAL_ENABLED": "false"}):
+            with self.assertRaises(RuntimeError):
+                main()
+        self.assertEqual(register.call_args.args[0][0]["last_error"], "empty-file registration: RuntimeError")
+        self.assertEqual(register.call_args.args[0][0]["status"], "failed")
+        archive.assert_not_called()
+
     @patch("src.utils.logger.get_logger")
     @patch("src.ingestion.fetch_arrivals.fetch_arrivals", side_effect=RuntimeError("https://private:secret@host"))
     def test_command_failure_logs_safe_type_and_exits_nonzero(self, fetch, get_logger):
