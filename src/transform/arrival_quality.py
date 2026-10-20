@@ -5,12 +5,13 @@ from collections import defaultdict
 COLUMNS = (
     "collection_timestamp", "station_id", "stop_id", "route_id", "destination_id",
     "file_id", "direction", "prediction_time", "arrival_time", "is_approaching",
-    "is_delayed", "latitude", "longitude", "heading", "wait_time", "run_number",
+    "is_delayed", "is_scheduled", "is_fault", "latitude", "longitude", "heading",
+    "wait_time", "run_number",
 )
 
-POLICY = "unknown_conflicts_v1"
-IDENTITY_INDEXES = (0, 2, 3, 8, 15)
-ALLOWED_FIELDS = {"heading", "latitude", "longitude", "is_delayed"}
+POLICY = "unknown_conflicts_v2"
+IDENTITY_INDEXES = (0, 2, 3, 8, 17)
+ALLOWED_FIELDS = {"heading", "latitude", "longitude", "is_delayed", "is_scheduled", "is_fault"}
 
 
 def resolve_unknowns(rows):

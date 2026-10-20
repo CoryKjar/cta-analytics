@@ -17,7 +17,7 @@ XML_SAMPLE = """<ctatt><tmst>20261016 16:21:19</tmst><eta>
 <staId>40540</staId><staNm>Wilson</staNm><stpId>30105</stpId>
 <rt>Red</rt><rn>812</rn><destNm>Howard</destNm><trDr>1</trDr>
 <prdt>20261016 16:21:00</prdt><arrT>20261016 16:25:00</arrT>
-<isApp>{approaching}</isApp><isDly>{delayed}</isDly>
+<isApp>{approaching}</isApp><isDly>{delayed}</isDly><isSch>0</isSch><isFlt>0</isFlt>
 <lat>{latitude}</lat><lon>{longitude}</lon><heading>0</heading>
 </eta></ctatt>"""
 
@@ -52,8 +52,24 @@ class BooleanParsingTests(unittest.TestCase):
         frame = sample_frame()
         self.assertFalse(frame.loc[0, "is_approaching"])
         self.assertTrue(frame.loc[0, "is_delayed"])
+        self.assertFalse(frame.loc[0, "is_scheduled"])
+        self.assertFalse(frame.loc[0, "is_fault"])
         self.assertEqual(frame.loc[0, "latitude"], "41.9")
         self.assertEqual(frame.loc[0, "longitude"], "-87.6")
+
+    def test_schedule_and_fault_flags_preserve_true_values_and_missingness(self):
+        xml = XML_SAMPLE.format(
+            approaching="0", delayed="0", latitude="", longitude="",
+        ).replace("<isSch>0</isSch>", "<isSch>1</isSch>")
+        xml = xml.replace("<isFlt>0</isFlt>", "<isFlt>1</isFlt>")
+        frame = parse_arrivals_xml(xml.encode(), "20261016_162119_Wilson.xml")
+        self.assertTrue(frame.loc[0, "is_scheduled"])
+        self.assertTrue(frame.loc[0, "is_fault"])
+
+        xml = xml.replace("<isSch>1</isSch>", "").replace("<isFlt>1</isFlt>", "")
+        frame = parse_arrivals_xml(xml.encode(), "20261016_162119_Wilson.xml")
+        self.assertIsNone(frame.loc[0, "is_scheduled"])
+        self.assertIsNone(frame.loc[0, "is_fault"])
 
     def test_missing_and_zero_api_coordinates_are_not_fabricated(self):
         frame = sample_frame(latitude="", longitude="")
@@ -124,7 +140,7 @@ class SourceVerificationTests(unittest.TestCase):
             self.collected, 40540, 30105, 1, 2, 10, "1",
             pd.Timestamp("2026-10-16 16:21:00").to_pydatetime(),
             pd.Timestamp("2026-10-16 16:25:00").to_pydatetime(),
-            False, True, 41.9, -87.6, 0, 4.0, "812",
+            False, True, False, False, 41.9, -87.6, 0, 4.0, "812",
         )])
 
     def test_source_metadata_and_unknown_dimensions_are_rejected(self):
@@ -146,6 +162,8 @@ class ArrivalLoaderTests(unittest.TestCase):
         duplicate = ET.fromstring(ET.tostring(root.find("eta")))
         duplicate.find("heading").text = "191"
         duplicate.find("isDly").text = "0"
+        duplicate.find("isSch").text = "1"
+        duplicate.find("isFlt").text = "1"
         root.append(duplicate)
         data = ET.tostring(root)
         frame = parse_arrivals_xml(data, "20261016_162119_Wilson.xml")
@@ -158,11 +176,15 @@ class ArrivalLoaderTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertIs(rows[0][9], False)
         self.assertIsNone(rows[0][10])
-        self.assertIsNone(rows[0][13])
-        self.assertEqual(rows[0][11:13], (41.9, -87.6))
+        self.assertEqual(rows[0][11:13], (None, None))
+        self.assertEqual(rows[0][13:15], (41.9, -87.6))
+        self.assertIsNone(rows[0][15])
         audit.assert_called_once()
         self.assertEqual(audit.call_args.args[4], data)
-        self.assertEqual(audit.call_args.args[5][0]["null_fields"], ["heading", "is_delayed"])
+        self.assertEqual(
+            audit.call_args.args[5][0]["null_fields"],
+            ["heading", "is_delayed", "is_fault", "is_scheduled"],
+        )
 
     def test_filename_station_lookup_is_exact(self):
         self.assertEqual(station_id_from_filename("20261016_162119_Wilson.xml"), 40540)
@@ -204,6 +226,7 @@ class ArrivalLoaderTests(unittest.TestCase):
         statement, records = cursor.executemany.call_args_list[-1].args
         self.assertIs(records[0][9], False)
         self.assertIs(records[0][10], False)
+        self.assertEqual(records[0][11:13], (False, False))
         self.assertIn("arrivals.file_id = EXCLUDED.file_id", statement)
         self.assertIn("IS DISTINCT FROM", statement)
         self.assertIn("arrival_time, run_number", statement)
@@ -212,10 +235,12 @@ class ArrivalLoaderTests(unittest.TestCase):
 
     @patch("src.storage.load_arrivals_postgres.psycopg.connect")
     def test_invalid_flag_fails_before_database_access(self, connect):
-        frame = sample_frame()
-        frame["is_delayed"] = "invalid"
-        with self.assertRaises(ValueError):
-            load_arrivals_data(frame)
+        for column in ("is_delayed", "is_scheduled", "is_fault"):
+            with self.subTest(column=column):
+                frame = sample_frame()
+                frame[column] = "invalid"
+                with self.assertRaises(ValueError):
+                    load_arrivals_data(frame)
         connect.assert_not_called()
 
 

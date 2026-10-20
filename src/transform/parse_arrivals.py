@@ -1,6 +1,7 @@
 import xml.etree.ElementTree as ET
 import gzip
 import re
+from datetime import datetime
 import pandas as pd
 from pathlib import Path
 
@@ -70,6 +71,8 @@ def parse_arrivals_xml(xml_bytes, source_file):
 
         is_approaching = parse_cta_boolean(eta.find("isApp").text)
         is_delayed = parse_cta_boolean(eta.find("isDly").text)
+        is_scheduled = parse_cta_boolean(eta.findtext("isSch"))
+        is_fault = parse_cta_boolean(eta.findtext("isFlt"))
         latitude = eta.find("lat").text
         longitude = eta.find("lon").text
         heading = eta.find("heading").text
@@ -91,6 +94,8 @@ def parse_arrivals_xml(xml_bytes, source_file):
             "arrival_time": arrival_time,
             "is_approaching": is_approaching,
             "is_delayed": is_delayed,
+            "is_scheduled": is_scheduled,
+            "is_fault": is_fault,
             "latitude": latitude,
             "longitude": longitude,
             "heading": heading,
@@ -111,20 +116,38 @@ def source_prediction_records(xml_bytes, file_record, routes, destinations):
         raise ValueError("Source API timestamp/error does not match the manifest.")
     if filename[:15] != collected.strftime("%Y%m%d_%H%M%S") or "/" in filename or "\\" in filename:
         raise ValueError("Source filename is not a valid manifest basename.")
-    frame = parse_arrivals_xml(xml_bytes, filename)
+    filename_time = datetime.strptime(
+        "_".join(Path(filename).stem.split("_")[:2]), "%Y%m%d_%H%M%S",
+    )
+    if filename_time != collected:
+        raise ValueError("Source filename timestamp does not match the manifest.")
+
     records = []
-    for row in frame.to_dict("records"):
-        if row["route"] not in routes or str(row["destination"]).strip() not in destinations:
+    for eta in root.findall("eta"):
+        station_id = int(eta.find("staId").text)
+        stop_id = int(eta.find("stpId").text)
+        route = eta.find("rt").text
+        destination = str(eta.find("destNm").text).strip()
+        if route not in routes or destination not in destinations:
             raise ValueError("Source route/destination is absent from the database dimensions.")
+
+        prediction_time = datetime.strptime(eta.find("prdt").text, "%Y%m%d %H:%M:%S")
+        arrival_time = datetime.strptime(eta.find("arrT").text, "%Y%m%d %H:%M:%S")
+        latitude = eta.find("lat").text
+        longitude = eta.find("lon").text
+        heading = eta.find("heading").text
         values = (
-            collected, int(row["station_id"]), int(row["stop_id"]), routes[row["route"]],
-            destinations[str(row["destination"]).strip()], file_id, row["direction"],
-            pd.Timestamp(row["prediction_time"]).to_pydatetime(),
-            pd.Timestamp(row["arrival_time"]).to_pydatetime(), row["is_approaching"], row["is_delayed"],
-            float(row["latitude"]) if pd.notna(row["latitude"]) else None,
-            float(row["longitude"]) if pd.notna(row["longitude"]) else None,
-            int(row["heading"]) if pd.notna(row["heading"]) else None,
-            float(row["wait_time"]), row["run_number"],
+            collected, station_id, stop_id, routes[route], destinations[destination], file_id,
+            eta.find("trDr").text, prediction_time, arrival_time,
+            parse_cta_boolean(eta.find("isApp").text),
+            parse_cta_boolean(eta.find("isDly").text),
+            parse_cta_boolean(eta.findtext("isSch")),
+            parse_cta_boolean(eta.findtext("isFlt")),
+            float(latitude) if latitude is not None else None,
+            float(longitude) if longitude is not None else None,
+            int(heading) if heading is not None else None,
+            (arrival_time - prediction_time).total_seconds() / 60,
+            parse_cta_run_number(eta.findtext("rn")),
         )
         records.append(values)
     return records

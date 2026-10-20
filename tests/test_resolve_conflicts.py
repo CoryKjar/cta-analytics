@@ -9,7 +9,7 @@ class UnknownResolutionTests(unittest.TestCase):
         self.row = (
             datetime(2026, 10, 5, 13, 1, 40), 40100, 30021, 7, 3, 1, "5",
             datetime(2026, 10, 5, 13, 1, 26), datetime(2026, 10, 5, 13, 2, 26),
-            True, False, 41.9, -87.6, 212, 1.0, "812",
+            True, False, False, False, 41.9, -87.6, 212, 1.0, "812",
         )
 
     def variant(self, **changes):
@@ -35,6 +35,14 @@ class UnknownResolutionTests(unittest.TestCase):
         rows, audit = resolve_unknowns([self.row, self.variant(is_delayed=True)])
         self.assertEqual(rows, [self.variant(is_delayed=None)])
         self.assertEqual(audit[0]["null_fields"], ["is_delayed"])
+
+    def test_schedule_and_fault_conflicts_are_unknown(self):
+        rows, audit = resolve_unknowns([
+            self.row,
+            self.variant(is_scheduled=True, is_fault=True),
+        ])
+        self.assertEqual(rows, [self.variant(is_scheduled=None, is_fault=None)])
+        self.assertEqual(audit[0]["null_fields"], ["is_fault", "is_scheduled"])
 
     def test_approaching_and_prediction_revisions_are_not_approved(self):
         for changed in (self.variant(is_approaching=False), self.variant(prediction_time=datetime(2026, 10, 5, 13))):

@@ -132,7 +132,8 @@ def load_arrivals_data(df):
     required = {
         "source_file", "collection_timestamp", "station_id", "stop_id",
         "route", "destination", "direction", "prediction_time",
-        "arrival_time", "is_approaching", "is_delayed", "latitude",
+        "arrival_time", "is_approaching", "is_delayed", "is_scheduled",
+        "is_fault", "latitude",
         "longitude", "heading", "wait_time", "run_number",
     }
     missing = required - set(df.columns)
@@ -140,7 +141,7 @@ def load_arrivals_data(df):
         raise ValueError(f"Arrival DataFrame missing columns: {sorted(missing)}")
 
     df = df.copy()
-    for column in ("is_approaching", "is_delayed"):
+    for column in ("is_approaching", "is_delayed", "is_scheduled", "is_fault"):
         df[column] = df[column].map(parse_cta_boolean)
     df["run_number"] = df["run_number"].map(parse_cta_run_number)
 
@@ -234,6 +235,8 @@ def load_arrivals_data(df):
                         pd.Timestamp(row["arrival_time"]).to_pydatetime(),
                         parse_cta_boolean(row["is_approaching"]),
                         parse_cta_boolean(row["is_delayed"]),
+                        parse_cta_boolean(row["is_scheduled"]),
+                        parse_cta_boolean(row["is_fault"]),
                         float(row["latitude"]) if pd.notna(row["latitude"]) else None,
                         float(row["longitude"]) if pd.notna(row["longitude"]) else None,
                         int(row["heading"]) if pd.notna(row["heading"]) else None,
@@ -276,15 +279,17 @@ def load_arrivals_data(df):
                 INSERT INTO arrivals (
                     collection_timestamp, station_id, stop_id, route_id,
                     destination_id, file_id, direction, prediction_time,
-                    arrival_time, is_approaching, is_delayed, latitude,
-                    longitude, heading, wait_time, run_number
+                    arrival_time, is_approaching, is_delayed, is_scheduled,
+                    is_fault, latitude, longitude, heading, wait_time, run_number
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (
                     collection_timestamp, stop_id, route_id, arrival_time, run_number
                 ) DO UPDATE SET
                     is_approaching = EXCLUDED.is_approaching,
                     is_delayed = EXCLUDED.is_delayed,
+                    is_scheduled = EXCLUDED.is_scheduled,
+                    is_fault = EXCLUDED.is_fault,
                     latitude = EXCLUDED.latitude,
                     longitude = EXCLUDED.longitude,
                     heading = EXCLUDED.heading
@@ -292,6 +297,8 @@ def load_arrivals_data(df):
                   AND (
                       arrivals.is_approaching IS DISTINCT FROM EXCLUDED.is_approaching
                       OR arrivals.is_delayed IS DISTINCT FROM EXCLUDED.is_delayed
+                      OR arrivals.is_scheduled IS DISTINCT FROM EXCLUDED.is_scheduled
+                      OR arrivals.is_fault IS DISTINCT FROM EXCLUDED.is_fault
                       OR arrivals.latitude IS DISTINCT FROM EXCLUDED.latitude
                       OR arrivals.longitude IS DISTINCT FROM EXCLUDED.longitude
                       OR arrivals.heading IS DISTINCT FROM EXCLUDED.heading
