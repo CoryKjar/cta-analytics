@@ -34,7 +34,7 @@ def connect():
     return psycopg.connect(url, connect_timeout=15)
 
 
-def collect_health():
+def collect_health(*, collection_window_hours=24):
     """Return current health metrics. Does not modify ingestion data."""
     with connect() as conn:
         latest = conn.execute("""
@@ -66,6 +66,16 @@ def collect_health():
             ORDER BY updated_at DESC
             LIMIT 100
         """).fetchall()
+
+        file_issue_logs = conn.execute("""
+            SELECT source_file, status, attempts, last_error, updated_at
+            FROM ingestion_files
+            WHERE (status <> 'processed' OR attempts > 0 OR last_error IS NOT NULL)
+              AND (%s::integer IS NULL OR collection_timestamp AT TIME ZONE 'America/Chicago'
+                   >= NOW() - (%s * INTERVAL '1 hour'))
+            ORDER BY updated_at DESC
+            LIMIT 100
+        """, (collection_window_hours, collection_window_hours)).fetchall()
 
         mismatch_count = conn.execute("""
             SELECT COUNT(*)::bigint
@@ -137,11 +147,11 @@ def collect_health():
                        COUNT(*) FILTER (WHERE a.status = 'in_progress')::bigint AS in_progress
                 FROM public.collection_runs AS r
                 LEFT JOIN public.collection_attempts AS a USING (run_id)
-                WHERE r.started_at >= NOW() - INTERVAL '24 hours'
+                WHERE (%s::integer IS NULL OR r.started_at >= NOW() - (%s * INTERVAL '1 hour'))
                 GROUP BY r.run_id
                 ORDER BY r.started_at DESC
                 LIMIT 20
-            """).fetchall()
+            """, (collection_window_hours, collection_window_hours)).fetchall()
             collection_attempt_logs = conn.execute("""
                 SELECT r.run_id::text, r.started_at, a.station_name, a.station_id,
                        a.station_index, a.status, a.stage, a.request_attempts,
@@ -150,11 +160,11 @@ def collect_health():
                        a.object_key, a.duration_seconds
                 FROM public.collection_attempts AS a
                 JOIN public.collection_runs AS r USING (run_id)
-                WHERE r.started_at >= NOW() - INTERVAL '24 hours'
-                  AND a.status <> 'uploaded'
+                                WHERE (%s::integer IS NULL OR r.started_at >= NOW() - (%s * INTERVAL '1 hour'))
+                  AND (a.status <> 'uploaded' OR a.request_attempts > 1)
                 ORDER BY r.started_at DESC, a.station_index
                 LIMIT 100
-            """).fetchall()
+                        """, (collection_window_hours, collection_window_hours)).fetchall()
 
     now = datetime.now(timezone.utc)
     age_minutes = None
@@ -244,6 +254,7 @@ def collect_health():
         "status_counts": status_counts,
         "retry_rows": retry_rows,
         "nonprocessed_rows": nonprocessed,
+        "file_issue_logs": file_issue_logs,
         "mismatch_count": mismatch_count,
         "stale_collection_runs": stale_collection_runs,
         "recent_partial_collection_runs": recent_partial_collection_runs,

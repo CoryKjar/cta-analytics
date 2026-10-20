@@ -59,12 +59,23 @@ class StationFreshnessTests(unittest.TestCase):
             return cursor
 
         conn.execute.side_effect = execute
-        health = collect_health()
+        for window_hours in (24, 720, None):
+            with self.subTest(window_hours=window_hours):
+                conn.execute.reset_mock()
+                health = collect_health(collection_window_hours=window_hours)
 
-        self.assertIn("collection_run_incomplete", health["issues"])
-        self.assertIn("partial_collection_run", health["issues"])
-        self.assertIn("stale-ru", health["issues"]["collection_run_incomplete"])
-        self.assertIn("58/143 uploaded", health["issues"]["partial_collection_run"])
+                self.assertIn("collection_run_incomplete", health["issues"])
+                self.assertIn("partial_collection_run", health["issues"])
+                self.assertIn("stale-ru", health["issues"]["collection_run_incomplete"])
+                self.assertIn("58/143 uploaded", health["issues"]["partial_collection_run"])
+                log_calls = [call for call in conn.execute.call_args_list
+                             if "%s::integer IS NULL" in call.args[0]]
+                self.assertEqual(len(log_calls), 3)
+                for call in log_calls:
+                    self.assertEqual(call.args[1], (window_hours, window_hours))
+                    self.assertNotIn("INTERVAL '24 hours'", call.args[0])
+                self.assertTrue(any("OR attempts > 0" in call.args[0] for call in log_calls))
+                self.assertTrue(any("OR a.request_attempts > 1" in call.args[0] for call in log_calls))
 
 
 class HealthLoggingTests(unittest.TestCase):

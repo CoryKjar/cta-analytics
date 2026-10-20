@@ -185,7 +185,7 @@ if not os.getenv("DATABASE_URL"):
     st.stop()
 
 try:
-    health = collect_health()
+    health = collect_health(collection_window_hours=window_hours)
     data = monitoring_data(window_hours)
 except Exception as exc:
     st.error(f"Dashboard data unavailable ({type(exc).__name__}).")
@@ -320,12 +320,35 @@ with quality_tab:
         with b:
             if not status_frame.empty:
                 bar_chart(status_frame, "Status", "Files", height=190)
-            retry_rows = health["retry_rows"]
-            if retry_rows:
-                retry_frame = pd.DataFrame(retry_rows, columns=["source_file", "status", "attempts", "last_error", "updated_at"])
-                st.dataframe(retry_frame[["source_file", "status", "attempts", "updated_at"]], use_container_width=True, hide_index=True)
 
         st.subheader("Collection logs")
+        collection_period = "across all history" if window_hours is None else f"in the last {window_label}"
+        file_issue_rows = health.get("file_issue_logs", [])
+        if file_issue_rows:
+            st.markdown("**Files with processing issues**")
+            file_frame = pd.DataFrame(file_issue_rows, columns=[
+                "Source file", "Status", "Failed attempts", "Last recorded error", "Updated",
+            ])
+            errors = file_frame["Last recorded error"].astype("string")
+            safe_errors = errors.str.fullmatch(
+                r"(?:parse|download|load|empty-file registration): [A-Za-z_][A-Za-z0-9_]*",
+                na=False,
+            )
+            file_frame["Last recorded error"] = errors.where(
+                safe_errors, "Stored error details unavailable in safe format",
+            )
+            no_error = errors.isna() | errors.eq("")
+            file_frame.loc[no_error, "Last recorded error"] = "No error reason recorded"
+            file_frame.loc[no_error & file_frame["Status"].eq("processed"), "Last recorded error"] = (
+                "Recovered; previous error not retained"
+            )
+            updated = pd.to_datetime(file_frame["Updated"], utc=True, errors="coerce")
+            file_frame["Updated"] = updated.dt.tz_convert("America/Chicago").dt.strftime(
+                "%Y-%m-%d %H:%M:%S %Z"
+            )
+            st.dataframe(file_frame, use_container_width=True, hide_index=True)
+        else:
+            st.caption(f"No file processing issues recorded {collection_period}.")
         if not health.get("has_collection_ledger", False):
             st.info("Collection-attempt logging is not installed in this database. Apply the collection ledger migration to enable it.")
         else:
@@ -343,11 +366,11 @@ with quality_tab:
                     )
                 st.dataframe(run_frame, use_container_width=True, hide_index=True)
             else:
-                st.caption("No collection runs recorded in the last 24 hours.")
+                st.caption(f"No collection runs recorded {collection_period}.")
 
             attempt_rows = health.get("collection_attempt_logs", [])
             if attempt_rows:
-                st.markdown("**Station attempts not uploaded**")
+                st.markdown("**Collection failures and request retries**")
                 attempt_frame = pd.DataFrame(attempt_rows, columns=[
                     "Run ID", "Run started", "Station", "Station ID", "Station index",
                     "Status", "Stage", "Request attempts", "HTTP status", "CTA error code",
@@ -361,6 +384,8 @@ with quality_tab:
                 )
                 st.dataframe(attempt_frame, use_container_width=True, hide_index=True)
             else:
-                st.success("No failed or incomplete station attempts in the last 24 hours.")
+                st.info(
+                    f"No collection failures or request retries recorded {collection_period}."
+                )
 
 st.markdown('<div class="dash-note">Read-only monitor · Snapshot coverage and source consistency do not establish actual train-arrival accuracy.</div>', unsafe_allow_html=True)

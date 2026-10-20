@@ -132,6 +132,11 @@ class ValidationHistoryTests(unittest.TestCase):
             "age_minutes": 1, "status_counts": {"processed": 12},
             "recent_updates": 12, "mismatch_count": 0,
             "nonprocessed_rows": [], "retry_rows": [],
+            "file_issue_logs": [
+                ("broken.xml", "failed", 1, "parse: ParseError", pd.Timestamp("2026-10-06T06:00Z")),
+                ("recovered.xml", "processed", 2, None, pd.Timestamp("2026-10-06T06:00Z")),
+                ("legacy.xml", "failed", 1, "private error with token=secret", pd.Timestamp("2026-10-06T06:00Z")),
+            ],
             "has_collection_ledger": True,
             "recent_collection_runs": [(
                 "run-12345678", pd.Timestamp("2026-10-06T06:00Z"),
@@ -146,7 +151,7 @@ class ValidationHistoryTests(unittest.TestCase):
             )],
         }
         with patch.dict("os.environ", {"DATABASE_URL": "unused"}), \
-                patch("src.monitoring.health_check.collect_health", return_value=health), \
+            patch("src.monitoring.health_check.collect_health", return_value=health) as collect, \
                 patch("dashboard.manifest_history.fetch_dashboard_history", return_value={
                     "hourly": frame,
                     "routes": pd.DataFrame({
@@ -168,6 +173,37 @@ class ValidationHistoryTests(unittest.TestCase):
                 }), \
                 patch("dashboard.manifest_history.fetch_manifest_history", return_value=pd.DataFrame()):
             app = AppTest.from_file(str(Path(__file__).resolve().parents[1] / "dashboard" / "app.py")).run(timeout=30)
+            collect.assert_called_with(collection_window_hours=168)
+            file_logs = [item.value for item in app.dataframe if "Failed attempts" in item.value.columns]
+            self.assertEqual(len(file_logs), 1)
+            self.assertEqual(file_logs[0]["Failed attempts"].tolist(), [1, 2, 1])
+            self.assertEqual(file_logs[0]["Last recorded error"].tolist(), [
+                "parse: ParseError", "Recovered; previous error not retained",
+                "Stored error details unavailable in safe format",
+            ])
+            attempt_logs = [item.value for item in app.dataframe if "Request attempts" in item.value.columns]
+            self.assertEqual(attempt_logs[0]["Storage error"].tolist(), ["AccessDenied"])
+            self.assertEqual(attempt_logs[0]["Stage"].tolist(), ["bucket_upload"])
+            health["recent_collection_runs"] = []
+            health["collection_attempt_logs"] = []
+            for label, hours, period in (
+                ("30 days", 720, "in the last 30 days"),
+                ("All history", None, "across all history"),
+            ):
+                with self.subTest(window=label):
+                    app.selectbox[0].select(label).run(timeout=30)
+                    self.assertFalse(app.exception)
+                    collect.assert_called_with(collection_window_hours=hours)
+                    self.assertIn(f"No collection runs recorded {period}.", [item.value for item in app.caption])
+                    self.assertIn(
+                        f"No collection failures or request retries recorded {period}.",
+                        [item.value for item in app.info],
+                    )
+                    self.assertFalse(any("below nominal" in item.value for item in app.warning))
+                    self.assertFalse(any("Below nominal" in item.value.columns for item in app.dataframe))
+            health["has_collection_ledger"] = False
+            app.run(timeout=30)
+            self.assertTrue(any("Failed attempts" in item.value.columns for item in app.dataframe))
         self.assertFalse(app.exception)
         self.assertEqual(app.selectbox[0].options, ["24 hours", "7 days", "30 days", "All history"])
         self.assertEqual([item.label for item in app.tabs], ["Overview", "Collection", "Forecast behavior", "Data quality"])
