@@ -90,12 +90,14 @@ def collect_health():
             GROUP BY station_id
         """).fetchall())
 
-        ledger_relation = conn.execute(
+        has_collection_ledger = conn.execute(
             "SELECT to_regclass('public.collection_runs')"
-        ).fetchone()[0]
+        ).fetchone()[0] is not None
         stale_collection_runs = []
         recent_partial_collection_runs = []
-        if ledger_relation is not None:
+        recent_collection_runs = []
+        collection_attempt_logs = []
+        if has_collection_ledger:
             stale_collection_runs = conn.execute("""
                 SELECT r.run_id::text, r.started_at, r.expected_station_count,
                        COUNT(*) FILTER (WHERE a.status = 'uploaded')::bigint AS uploaded,
@@ -118,34 +120,40 @@ def collect_health():
                 ORDER BY completed_at DESC
                 LIMIT 10
             """, (COLLECTION_RUN_STALE_MINUTES,)).fetchall()
-
-        has_collection_ledger = conn.execute(
-            "SELECT to_regclass('public.collection_runs')"
-        ).fetchone()[0] is not None
-        stale_collection_runs = []
-        recent_partial_collection_runs = []
-        if has_collection_ledger:
-            stale_collection_runs = conn.execute("""
-                SELECT r.run_id::text, r.started_at, r.expected_station_count,
-                       COUNT(*) FILTER (WHERE a.status = 'uploaded')::bigint AS uploaded,
-                       COUNT(*) FILTER (WHERE a.status = 'failed')::bigint AS failed,
-                       COUNT(*) FILTER (WHERE a.status IN ('pending', 'in_progress'))::bigint AS unfinished
-                FROM public.collection_runs AS r
-                LEFT JOIN public.collection_attempts AS a USING (run_id)
-                WHERE r.status = 'running'
-                  AND r.started_at < NOW() - (%s * INTERVAL '1 minute')
-                GROUP BY r.run_id
-                ORDER BY r.started_at DESC
-                LIMIT 10
-            """, (COLLECTION_RUN_STALE_MINUTES,)).fetchall()
             recent_partial_collection_runs = conn.execute("""
                 SELECT run_id::text, started_at, status, expected_station_count,
-                       uploaded_station_count, failed_station_count
+                       uploaded_station_count, failed_station_count, fatal_error_type
                 FROM public.collection_runs
                 WHERE status IN ('partial', 'failed')
-                  AND completed_at >= NOW() - INTERVAL '15 minutes'
+                  AND completed_at >= NOW() - INTERVAL '24 hours'
                 ORDER BY completed_at DESC
-                LIMIT 10
+                LIMIT 20
+            """).fetchall()
+            recent_collection_runs = conn.execute("""
+                SELECT r.run_id::text, r.started_at, r.completed_at, r.status,
+                       r.expected_station_count, r.uploaded_station_count,
+                       r.failed_station_count, r.fatal_error_type,
+                       COUNT(*) FILTER (WHERE a.status = 'pending')::bigint AS pending,
+                       COUNT(*) FILTER (WHERE a.status = 'in_progress')::bigint AS in_progress
+                FROM public.collection_runs AS r
+                LEFT JOIN public.collection_attempts AS a USING (run_id)
+                WHERE r.started_at >= NOW() - INTERVAL '24 hours'
+                GROUP BY r.run_id
+                ORDER BY r.started_at DESC
+                LIMIT 20
+            """).fetchall()
+            collection_attempt_logs = conn.execute("""
+                SELECT r.run_id::text, r.started_at, a.station_name, a.station_id,
+                       a.station_index, a.status, a.stage, a.request_attempts,
+                       a.http_status, a.cta_error_code, a.storage_error_code,
+                       a.storage_http_status, a.error_type, a.source_file,
+                       a.object_key, a.duration_seconds
+                FROM public.collection_attempts AS a
+                JOIN public.collection_runs AS r USING (run_id)
+                WHERE r.started_at >= NOW() - INTERVAL '24 hours'
+                  AND a.status <> 'uploaded'
+                ORDER BY r.started_at DESC, a.station_index
+                LIMIT 100
             """).fetchall()
 
     now = datetime.now(timezone.utc)
@@ -239,6 +247,9 @@ def collect_health():
         "mismatch_count": mismatch_count,
         "stale_collection_runs": stale_collection_runs,
         "recent_partial_collection_runs": recent_partial_collection_runs,
+        "has_collection_ledger": has_collection_ledger,
+        "recent_collection_runs": recent_collection_runs,
+        "collection_attempt_logs": collection_attempt_logs,
         "recent_updates": recent_updates,
         "issues": issues,
         "stale_stations": stale_stations,

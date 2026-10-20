@@ -325,4 +325,42 @@ with quality_tab:
                 retry_frame = pd.DataFrame(retry_rows, columns=["source_file", "status", "attempts", "last_error", "updated_at"])
                 st.dataframe(retry_frame[["source_file", "status", "attempts", "updated_at"]], use_container_width=True, hide_index=True)
 
+        st.subheader("Collection logs")
+        if not health.get("has_collection_ledger", False):
+            st.info("Collection-attempt logging is not installed in this database. Apply the collection ledger migration to enable it.")
+        else:
+            run_rows = health.get("recent_collection_runs", [])
+            if run_rows:
+                run_frame = pd.DataFrame(run_rows, columns=[
+                    "Run ID", "Started", "Finished", "Status", "Expected stations",
+                    "Uploaded", "Failed", "Fatal error", "Pending", "In progress",
+                ])
+                run_frame["Run ID"] = run_frame["Run ID"].str.slice(0, 8)
+                for column in ("Started", "Finished"):
+                    values = pd.to_datetime(run_frame[column], utc=True, errors="coerce")
+                    run_frame[column] = values.dt.tz_convert("America/Chicago").dt.strftime(
+                        "%Y-%m-%d %H:%M:%S %Z"
+                    )
+                st.dataframe(run_frame, use_container_width=True, hide_index=True)
+            else:
+                st.caption("No collection runs recorded in the last 24 hours.")
+
+            attempt_rows = health.get("collection_attempt_logs", [])
+            if attempt_rows:
+                st.markdown("**Station attempts not uploaded**")
+                attempt_frame = pd.DataFrame(attempt_rows, columns=[
+                    "Run ID", "Run started", "Station", "Station ID", "Station index",
+                    "Status", "Stage", "Request attempts", "HTTP status", "CTA error code",
+                    "Storage error", "Storage HTTP status", "Error type", "Source file",
+                    "Bucket key", "Duration (s)",
+                ])
+                attempt_frame["Run ID"] = attempt_frame["Run ID"].str.slice(0, 8)
+                run_started = pd.to_datetime(attempt_frame["Run started"], utc=True, errors="coerce")
+                attempt_frame["Run started"] = run_started.dt.tz_convert("America/Chicago").dt.strftime(
+                    "%Y-%m-%d %H:%M:%S %Z"
+                )
+                st.dataframe(attempt_frame, use_container_width=True, hide_index=True)
+            else:
+                st.success("No failed or incomplete station attempts in the last 24 hours.")
+
 st.markdown('<div class="dash-note">Read-only monitor · Snapshot coverage and source consistency do not establish actual train-arrival accuracy.</div>', unsafe_allow_html=True)

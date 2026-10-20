@@ -60,6 +60,8 @@ Production schedules are collection and health checks every five minutes, with r
 
 The dashboard includes a 24-hour, 7-day, 30-day or full-history monitor for station coverage, prediction volume, consistency checks, forecast horizons, CTA-reported delay flags and coordinate availability. Historical queries use one read-only consistent database snapshot and cache results for five minutes; Refresh clears the cache. Empty station responses count toward coverage. Nominal coverage assumes 12 snapshots per configured station per full hour; partial boundary hours are excluded from hourly coverage. Missing hours remain visible, unknown delay flags are not treated as false, and Chicago hour labels distinguish DST offsets. Forecast horizons and reported flags describe CTA's prediction feed; without observed arrival outcomes, the plots do not measure prediction accuracy.
 
+After the collection-attempt ledger migration is applied, the dashboard's Data quality tab also shows the last 24 hours of collection runs and non-uploaded station attempts, with stage and safe error-code details. If the ledger schema is absent, the dashboard displays an informational notice and the other panels remain available.
+
 ## Tests
 
 ```powershell

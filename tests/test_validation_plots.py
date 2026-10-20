@@ -132,6 +132,18 @@ class ValidationHistoryTests(unittest.TestCase):
             "age_minutes": 1, "status_counts": {"processed": 12},
             "recent_updates": 12, "mismatch_count": 0,
             "nonprocessed_rows": [], "retry_rows": [],
+            "has_collection_ledger": True,
+            "recent_collection_runs": [(
+                "run-12345678", pd.Timestamp("2026-10-06T06:00Z"),
+                pd.Timestamp("2026-10-06T06:01Z"), "partial", 143, 142, 1,
+                None, 0, 0,
+            )],
+            "collection_attempt_logs": [(
+                "run-12345678", pd.Timestamp("2026-10-06T06:00Z"),
+                "Wilson", 40540, 143, "failed", "bucket_upload", 1, 200,
+                None, "AccessDenied", 403, "ClientError",
+                "snapshot.xml", "raw/2026/10/06/snapshot.xml", 0.5,
+            )],
         }
         with patch.dict("os.environ", {"DATABASE_URL": "unused"}), \
                 patch("src.monitoring.health_check.collect_health", return_value=health), \
@@ -159,6 +171,7 @@ class ValidationHistoryTests(unittest.TestCase):
         self.assertFalse(app.exception)
         self.assertEqual(app.selectbox[0].options, ["24 hours", "7 days", "30 days", "All history"])
         self.assertEqual([item.label for item in app.tabs], ["Overview", "Collection", "Forecast behavior", "Data quality"])
+        self.assertIn("Collection logs", [item.value for item in app.subheader])
         self.assertGreaterEqual(len(app.get("vega_lite_chart")), 7)
         self.assertIn("Clear", [item.value for item in app.metric])
         charts = app.get("vega_lite_chart") or app.get("arrow_vega_lite_chart")
