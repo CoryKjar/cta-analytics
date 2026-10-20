@@ -69,10 +69,10 @@ def line_chart(frame, columns, *, height=270, percent=False):
                 ],
             },
             "config": {
-                "background": "#ffffff",
-                "view": {"stroke": "#dce5e1", "strokeWidth": 1},
-                "axis": {"labelColor": "#596b69", "titleColor": "#687a78", "gridColor": "#e8eeeb"},
-                "legend": {"labelColor": "#596b69", "titleColor": "#687a78"},
+                "background": "#172428",
+                "view": {"stroke": "#30464b", "strokeWidth": 1},
+                "axis": {"labelColor": "#b8c8c6", "titleColor": "#a8bcba", "gridColor": "#2a3c41"},
+                "legend": {"labelColor": "#cbd8d6", "titleColor": "#a8bcba"},
             },
         },
         use_container_width=True,
@@ -99,7 +99,7 @@ def bar_chart(frame, category, columns, *, height=300, horizontal=True):
                 "x" if horizontal else "y": {
                     "field": "Value", "type": "quantitative", "title": None,
                     "scale": {"zero": True},
-                    "axis": {"labelColor": "#596b69", "gridColor": "#e8eeeb"},
+                    "axis": {"labelColor": "#b8c8c6", "gridColor": "#2a3c41"},
                 },
                 "color": {"field": "Metric", "type": "nominal", "title": None,
                           "scale": {"scheme": "tableau10"}, "legend": {"orient": "bottom"}},
@@ -110,10 +110,10 @@ def bar_chart(frame, category, columns, *, height=300, horizontal=True):
                 ],
             },
             "config": {
-                "background": "#ffffff",
-                "view": {"stroke": "#dce5e1", "strokeWidth": 1},
-                "axis": {"labelColor": "#596b69", "titleColor": "#687a78", "gridColor": "#e8eeeb"},
-                "legend": {"labelColor": "#596b69", "titleColor": "#687a78"},
+                "background": "#172428",
+                "view": {"stroke": "#30464b", "strokeWidth": 1},
+                "axis": {"labelColor": "#b8c8c6", "titleColor": "#a8bcba", "gridColor": "#2a3c41"},
+                "legend": {"labelColor": "#cbd8d6", "titleColor": "#a8bcba"},
             },
         },
         use_container_width=True,
@@ -125,23 +125,24 @@ st.markdown(
     """
     <style>
     :root {
-        --ink: #182b2c;
-        --muted: #687a78;
-        --line: #dce5e1;
-        --paper: #f3f6f3;
-        --teal: #087f78;
+        --ink: #e4eeec;
+        --muted: #9eb2b0;
+        --line: #2d4146;
+        --paper: #0d171a;
+        --panel: #172428;
+        --teal: #56d6be;
     }
-    [data-testid="stAppViewContainer"] { background: var(--paper); }
-    [data-testid="stHeader"] { background: transparent; }
+    [data-testid="stAppViewContainer"] { background: var(--paper); color: var(--ink); }
+    [data-testid="stHeader"] { background: var(--paper); }
     [data-testid="stMainBlockContainer"] { max-width: 1500px; padding-top: 1.2rem; }
-    section[data-testid="stSidebar"] { background: #202d35; }
-    section[data-testid="stSidebar"] * { color: #e1ebe9 !important; }
-    section[data-testid="stSidebar"] [data-testid="stWidgetLabel"] p { color: #b8c9c7 !important; }
-    [data-testid="stSidebar"] [data-testid="stSelectbox"] div[role="combobox"] { background: #ffffff; }
+    section[data-testid="stSidebar"] { background: #111d21; border-right: 1px solid var(--line); }
+    section[data-testid="stSidebar"] * { color: #dce8e5 !important; }
+    section[data-testid="stSidebar"] [data-testid="stWidgetLabel"] p { color: #a9bdb9 !important; }
+    [data-testid="stSidebar"] [data-testid="stSelectbox"] div[role="combobox"] { background: #1b2a2e; }
     section[data-testid="stSidebar"] [data-testid="stButton"] button {
-        border-color: #78918f; color: #f1f5f3; background: #2b3c43;
+        border-color: #456065; color: #e5efed; background: #1a2a2e;
     }
-    section[data-testid="stSidebar"] [data-testid="stButton"] button:hover { border-color: #87c9bb; color: #ffffff !important; }
+    section[data-testid="stSidebar"] [data-testid="stButton"] button:hover { border-color: var(--teal); color: #ffffff !important; }
     [data-testid="stAppViewContainer"] h1,
     [data-testid="stAppViewContainer"] h2,
     [data-testid="stAppViewContainer"] h3 { color: var(--ink) !important; }
@@ -149,14 +150,16 @@ st.markdown(
     [data-testid="stAppViewContainer"] h2 { font-size: 1.18rem; font-weight: 650; }
     [data-testid="stAppViewContainer"] [data-testid="stMarkdownContainer"] p { color: var(--muted); }
     [data-testid="stMetric"] {
-        background: #ffffff; border: 1px solid var(--line); border-top: 3px solid var(--teal);
+        background: var(--panel); border: 1px solid var(--line); border-top: 3px solid var(--teal);
         padding: .7rem .85rem; border-radius: 4px;
     }
     [data-testid="stMetricLabel"] { color: var(--muted); }
     [data-testid="stMetricValue"] { color: var(--ink); }
+    [data-testid="stAlert"] { background: #172b2c; border-color: #315054; color: var(--ink); }
     [data-testid="stTabs"] button[role="tab"] { color: var(--muted) !important; }
     [data-testid="stTabs"] button[aria-selected="true"] { color: var(--teal) !important; border-bottom-color: var(--teal) !important; }
     div[data-testid="stDataFrame"] { border: 1px solid var(--line); }
+    hr { border-color: var(--line); }
     .dash-kicker { color: var(--teal); font-size: .76rem; font-weight: 700; text-transform: uppercase; }
     .dash-note { color: var(--muted); font-size: .86rem; }
     </style>
@@ -226,17 +229,17 @@ overview, collection, forecast, quality_tab = st.tabs(["Overview", "Collection",
 with overview:
     left, right = st.columns([1.45, 1])
     with left:
-        st.subheader("Collection against expected cadence")
+        st.subheader("Collection polling cadence")
         if not hourly.empty:
             line_chart(hourly, ["Snapshots", "Nominal snapshots"], height=300)
         else:
             st.info("No snapshots in this time range.")
     with right:
-        st.subheader("Station coverage")
+        st.subheader("Station polling coverage")
         if not stations.empty:
             low = stations.head(12).sort_values("Coverage (%)", ascending=True)
-            bar_chart(low, "Station", "Coverage (%)", height=340)
-            st.caption("Lowest-coverage stations in the selected window. Empty API responses count as collected snapshots.")
+            bar_chart(low, "Station", "Coverage (%)", height=300)
+            st.caption("Lowest polling coverage. This measures poll completion, not service hours; valid empty responses count as collected.")
     st.subheader("Prediction volume")
     if not hourly.empty:
         line_chart(hourly, "Predictions", height=240)
@@ -250,7 +253,7 @@ with overview:
 with collection:
     coverage_column, empty_column = st.columns(2)
     with coverage_column:
-        st.subheader("Full-hour snapshot coverage")
+        st.subheader("Full-hour polling coverage")
         if not hourly.empty:
             line_chart(hourly, "Coverage (%)", height=300, percent=True)
     with empty_column:
@@ -266,7 +269,7 @@ with forecast:
     wait_column, delay_column = st.columns(2)
     with wait_column:
         st.subheader("Predicted wait horizon over time")
-        st.caption("Median and 90th percentile of (predicted arrival − prediction time).")
+        st.caption("Median and 90th percentile of predicted arrival minus prediction time. These are forecast lead times, not observed waits.")
         if not hourly.empty:
             line_chart(hourly, ["Wait median (min)", "Wait p90 (min)"], height=300)
     with delay_column:
@@ -284,15 +287,30 @@ with forecast:
 
 with quality_tab:
     if not hourly.empty:
-        integrity, source_fields = st.columns(2)
-        with integrity:
-            st.subheader("Internal consistency checks")
-            st.caption("Invalid means missing required values, malformed run identity, wait arithmetic/timing violations, or out-of-range source values.")
-            line_chart(hourly, "Invalid prediction rows", height=260)
-            line_chart(hourly, ["Manifest mismatches", "Unprocessed files"], height=260)
-        with source_fields:
-            st.subheader("Unknown and unavailable source fields")
-            line_chart(hourly, ["Unknown delay (%)", "Missing GPS (%)", "Zero GPS (%)"], height=300, percent=True)
+        st.subheader("Internal consistency checks")
+        invalid_column, manifest_column = st.columns(2)
+        with invalid_column:
+            st.markdown("**Invalid prediction rows**")
+            st.caption("Missing required values, malformed run identity, wait arithmetic/timing violations, or out-of-range source values.")
+            line_chart(hourly, "Invalid prediction rows", height=280)
+        with manifest_column:
+            st.markdown("**Manifest reconciliation**")
+            st.caption("Processed-file row counts that do not match stored arrivals, plus files not yet processed.")
+            line_chart(hourly, ["Manifest mismatches", "Unprocessed files"], height=280)
+
+        st.subheader("Source-field availability")
+        gps_column, flag_column = st.columns(2)
+        with gps_column:
+            st.markdown("**Missing GPS by prediction type**")
+            st.caption("Schedule-based predictions may not include a live train position.")
+            line_chart(hourly, [
+                "Scheduled missing GPS (%)", "Live missing GPS (%)",
+                "Unclassified missing GPS (%)",
+            ], height=300, percent=True)
+        with flag_column:
+            st.markdown("**Unknown delay flags and zero coordinates**")
+            line_chart(hourly, ["Unknown delay (%)", "Zero GPS (%)"], height=300, percent=True)
+
         st.subheader("Status and retries")
         processed_count, status_frame, manifest_state = build_manifest_status_view(health["status_counts"])
         a, b = st.columns([1, 2])

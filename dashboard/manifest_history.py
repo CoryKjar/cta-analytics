@@ -82,6 +82,9 @@ VALIDATION_COLUMNS = (
     "hour_utc", "snapshot_files", "empty_files", "unprocessed_files",
     "manifest_mismatches", "prediction_rows", "invalid_rows", "delayed_rows",
     "not_delayed_rows", "unknown_delay_rows", "missing_gps_rows", "zero_gps_rows",
+    "scheduled_rows", "live_rows", "unknown_schedule_rows",
+    "scheduled_missing_gps_rows", "live_missing_gps_rows",
+    "unclassified_missing_gps_rows",
     "median_wait", "p90_wait",
 )
 
@@ -110,7 +113,16 @@ VALIDATION_HISTORY_QUERY = """
                COUNT(*) FILTER (WHERE a.is_delayed IS FALSE)::bigint AS not_delayed_rows,
                COUNT(*) FILTER (WHERE a.is_delayed IS NULL)::bigint AS unknown_delay_rows,
                COUNT(*) FILTER (WHERE a.latitude IS NULL OR a.longitude IS NULL)::bigint AS missing_gps_rows,
-               COUNT(*) FILTER (WHERE a.latitude = 0 AND a.longitude = 0)::bigint AS zero_gps_rows
+               COUNT(*) FILTER (WHERE a.latitude = 0 AND a.longitude = 0)::bigint AS zero_gps_rows,
+               COUNT(*) FILTER (WHERE a.is_scheduled IS TRUE)::bigint AS scheduled_rows,
+               COUNT(*) FILTER (WHERE a.is_scheduled IS FALSE)::bigint AS live_rows,
+               COUNT(*) FILTER (WHERE a.is_scheduled IS NULL)::bigint AS unknown_schedule_rows,
+               COUNT(*) FILTER (WHERE a.is_scheduled IS TRUE
+                   AND (a.latitude IS NULL OR a.longitude IS NULL))::bigint AS scheduled_missing_gps_rows,
+               COUNT(*) FILTER (WHERE a.is_scheduled IS FALSE
+                   AND (a.latitude IS NULL OR a.longitude IS NULL))::bigint AS live_missing_gps_rows,
+               COUNT(*) FILTER (WHERE a.is_scheduled IS NULL
+                   AND (a.latitude IS NULL OR a.longitude IS NULL))::bigint AS unclassified_missing_gps_rows
         FROM arrivals a JOIN scoped_files f USING (file_id) GROUP BY a.file_id
     ), hourly_forecast AS (
         SELECT date_trunc('hour', a.collection_timestamp AT TIME ZONE 'America/Chicago', 'UTC') AS hour_utc,
@@ -132,13 +144,22 @@ VALIDATION_HISTORY_QUERY = """
                COALESCE(SUM(p.not_delayed_rows), 0)::bigint AS not_delayed_rows,
                COALESCE(SUM(p.unknown_delay_rows), 0)::bigint AS unknown_delay_rows,
                COALESCE(SUM(p.missing_gps_rows), 0)::bigint AS missing_gps_rows,
-               COALESCE(SUM(p.zero_gps_rows), 0)::bigint AS zero_gps_rows
+               COALESCE(SUM(p.zero_gps_rows), 0)::bigint AS zero_gps_rows,
+               COALESCE(SUM(p.scheduled_rows), 0)::bigint AS scheduled_rows,
+               COALESCE(SUM(p.live_rows), 0)::bigint AS live_rows,
+               COALESCE(SUM(p.unknown_schedule_rows), 0)::bigint AS unknown_schedule_rows,
+               COALESCE(SUM(p.scheduled_missing_gps_rows), 0)::bigint AS scheduled_missing_gps_rows,
+               COALESCE(SUM(p.live_missing_gps_rows), 0)::bigint AS live_missing_gps_rows,
+               COALESCE(SUM(p.unclassified_missing_gps_rows), 0)::bigint AS unclassified_missing_gps_rows
         FROM scoped_files f LEFT JOIN prediction_counts p USING (file_id)
         GROUP BY 1
     )
     SELECT h.hour_utc,h.snapshot_files,h.empty_files,h.unprocessed_files,
            h.manifest_mismatches,h.prediction_rows,h.invalid_rows,h.delayed_rows,
            h.not_delayed_rows,h.unknown_delay_rows,h.missing_gps_rows,h.zero_gps_rows,
+           h.scheduled_rows,h.live_rows,h.unknown_schedule_rows,
+           h.scheduled_missing_gps_rows,h.live_missing_gps_rows,
+           h.unclassified_missing_gps_rows,
            f.median_wait,f.p90_wait
     FROM hourly_files h LEFT JOIN hourly_forecast f USING (hour_utc)
     ORDER BY h.hour_utc
@@ -195,6 +216,14 @@ def build_validation_history_frame(rows, window_start, as_of, station_count):
     frame["Unknown delay (%)"] = 100 * frame["unknown_delay_rows"] / predictions
     frame["Missing GPS (%)"] = 100 * frame["missing_gps_rows"] / predictions
     frame["Zero GPS (%)"] = 100 * frame["zero_gps_rows"] / predictions
+    scheduled = frame["scheduled_rows"].replace(0, float("nan"))
+    live = frame["live_rows"].replace(0, float("nan"))
+    unclassified = frame["unknown_schedule_rows"].replace(0, float("nan"))
+    frame["Scheduled missing GPS (%)"] = 100 * frame["scheduled_missing_gps_rows"] / scheduled
+    frame["Live missing GPS (%)"] = 100 * frame["live_missing_gps_rows"] / live
+    frame["Unclassified missing GPS (%)"] = (
+        100 * frame["unclassified_missing_gps_rows"] / unclassified
+    )
     frame["Hour"] = frame.index.tz_convert("America/Chicago").strftime("%Y-%m-%d %H:%M %Z")
     frame["Wait median (min)"] = frame["median_wait"]
     frame["Wait p90 (min)"] = frame["p90_wait"]

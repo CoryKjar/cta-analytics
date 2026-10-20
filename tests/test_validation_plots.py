@@ -38,6 +38,20 @@ class ValidationHistoryTests(unittest.TestCase):
         self.assertEqual(frame.loc[0, "Zero GPS (%)"], 10)
         self.assertTrue(pd.isna(frame.loc[1, "Reported delayed (%)"]))
 
+    def test_missing_gps_rates_are_split_by_prediction_type(self):
+        rows = [history_row(
+            "2026-10-06T05:00Z", snapshot_files=12, prediction_rows=100,
+            scheduled_rows=40, live_rows=50, unknown_schedule_rows=10,
+            scheduled_missing_gps_rows=20, live_missing_gps_rows=5,
+            unclassified_missing_gps_rows=10,
+        )]
+        frame = build_validation_history_frame(
+            rows, "2026-10-06T05:00Z", "2026-10-06T06:00Z", 1,
+        )
+        self.assertEqual(frame.loc[0, "Scheduled missing GPS (%)"], 50)
+        self.assertEqual(frame.loc[0, "Live missing GPS (%)"], 10)
+        self.assertEqual(frame.loc[0, "Unclassified missing GPS (%)"], 100)
+
     def test_empty_history_and_empty_snapshots_remain_distinct(self):
         self.assertTrue(build_validation_history_frame([], None, "2026-10-06T06:00Z", 1).empty)
         rows = [history_row("2026-10-06T05:00Z", snapshot_files=12, empty_files=12)]
