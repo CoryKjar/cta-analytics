@@ -54,7 +54,7 @@ from src.storage.load_arrivals_postgres import load_arrivals_data, register_file
 
 from src.transform.parse_arrivals import parse_arrivals
 
-from src.utils.archive import archive_files
+from src.utils.cleanup_staging import cleanup_staged_files
 from src.utils.logger import get_logger
 from src.storage.object_storage import storage_error_details
 
@@ -510,7 +510,7 @@ def _run_self_heal():
             if path.name in good_names
         ]
         if good_paths:
-            archive_files(good_paths)
+            cleanup_staged_files(good_paths)
 
     skipped = sum(1 for row in manifest.values() if row["status"] != "processed" and row["attempts"] >= MAX_ATTEMPTS)
     if skipped:

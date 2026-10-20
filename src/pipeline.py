@@ -7,7 +7,7 @@ import pandas as pd
 from src.ingestion.fetch_arrivals import fetch_arrivals
 from src.transform.parse_arrivals import parse_arrivals
 from src.storage.load_arrivals_postgres import load_arrivals_data, register_file_results
-from src.utils.archive import archive_files
+from src.utils.cleanup_staging import cleanup_staged_files
 from src.utils.logger import get_logger
 from src.config.stations import STATIONS
 
@@ -95,7 +95,7 @@ def main():
         if Path(path).name in successfully_loaded_files or Path(path).name in successfully_empty_files
     ]
     if safe_to_archive:
-        archive_files(safe_to_archive)
+        cleanup_staged_files(safe_to_archive)
         logger.info("event=files_archived count=%s", len(safe_to_archive))
 
     logger.info(

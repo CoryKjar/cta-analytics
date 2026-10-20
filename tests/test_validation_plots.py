@@ -5,8 +5,10 @@ from unittest.mock import patch
 import pandas as pd
 
 from dashboard.manifest_history import (
-    VALIDATION_COLUMNS, build_validation_history_frame, fetch_validation_history,
+    VALIDATION_COLUMNS, build_route_quality_frame, build_station_coverage_frame,
+    build_validation_history_frame, fetch_dashboard_history, fetch_validation_history,
 )
+from src.config.stations import STATIONS
 
 
 def history_row(hour, **counts):
@@ -28,7 +30,7 @@ class ValidationHistoryTests(unittest.TestCase):
         rows = [history_row("2026-10-06T05:00Z", snapshot_files=12, prediction_rows=10,
                             delayed_rows=2, not_delayed_rows=6, unknown_delay_rows=2,
                             missing_gps_rows=3, zero_gps_rows=1)]
-        frame = build_validation_history_frame(rows, "2026-10-06T05:00Z", "2026-10-06T06:00Z", 1)
+        frame = build_validation_history_frame(rows, "2026-10-06T05:00Z", "2026-10-06T06:30Z", 1)
         self.assertEqual(frame.loc[0, "Coverage (%)"], 100)
         self.assertEqual(frame.loc[0, "Reported delayed (%)"], 25)
         self.assertEqual(frame.loc[0, "Unknown delay (%)"], 20)
@@ -50,6 +52,22 @@ class ValidationHistoryTests(unittest.TestCase):
         self.assertTrue(frame.loc[0, "Hour"].endswith("01:00 CDT"))
         self.assertTrue(frame.loc[1, "Hour"].endswith("01:00 CST"))
 
+    def test_station_coverage_includes_configured_stations_with_no_files(self):
+        first_id = next(iter(STATIONS.values()))
+        frame = build_station_coverage_frame(
+            [(first_id, 287, 1, 2, pd.Timestamp("2026-10-06 00:00:00"))],
+            "2026-10-05T05:00Z", "2026-10-06T05:00Z",
+        )
+        self.assertEqual(len(frame), len(STATIONS))
+        self.assertAlmostEqual(frame.loc[frame["Station ID"] == first_id, "Coverage (%)"].iloc[0], 287 / 288 * 100)
+        self.assertEqual(frame.iloc[0]["Snapshots"], 0)
+        self.assertEqual(frame.iloc[0]["Coverage (%)"], 0)
+
+    def test_route_delay_rate_excludes_unknown_flag_values(self):
+        frame = build_route_quality_frame([("Red", 10, 8.0, 18.0, 2, 6, 2)])
+        self.assertEqual(frame.loc[0, "Reported delayed (%)"], 25)
+        self.assertEqual(frame.loc[0, "Unknown delay (%)"], 20)
+
     @patch("dashboard.manifest_history.connect")
     def test_fetch_uses_read_only_consistent_snapshot(self, connect):
         conn = connect.return_value.__enter__.return_value
@@ -57,6 +75,36 @@ class ValidationHistoryTests(unittest.TestCase):
         conn.execute.return_value.fetchall.return_value = []
         self.assertTrue(fetch_validation_history().empty)
         self.assertEqual(conn.execute.call_args_list[0].args[0], "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+
+    @patch("dashboard.manifest_history.connect")
+    def test_window_and_route_station_panels_share_one_read_only_snapshot(self, connect):
+        conn = connect.return_value.__enter__.return_value
+        first = pd.Timestamp("2026-10-05T05:00Z")
+        as_of = pd.Timestamp("2026-10-12T05:00Z")
+
+        def execute(query, parameters=None):
+            cursor = unittest.mock.MagicMock()
+            if query.startswith("SELECT MIN(collection_timestamp"):
+                cursor.fetchone.return_value = (first, as_of)
+            elif query == VALIDATION_HISTORY_QUERY:
+                cursor.fetchall.return_value = []
+            elif query.startswith("\n    SELECT r.route_name"):
+                cursor.fetchall.return_value = [("Red", 20, 10.0, 20.0, 2, 16, 2)]
+            else:
+                cursor.fetchall.return_value = [(next(iter(STATIONS.values())), 1008, 0, 4, first)]
+            return cursor
+
+        from dashboard.manifest_history import VALIDATION_HISTORY_QUERY
+
+        conn.execute.side_effect = execute
+        result = fetch_dashboard_history(168)
+        self.assertEqual(result["window_start"], first)
+        self.assertEqual(len(result["routes"]), 1)
+        self.assertEqual(result["routes"].loc[0, "Reported delayed (%)"], 11.11111111111111)
+        bounded_calls = [call for call in conn.execute.call_args_list if call.args[0] in (VALIDATION_HISTORY_QUERY,)]
+        self.assertEqual(len(bounded_calls), 1)
+        self.assertEqual(bounded_calls[0].args[1], (first.to_pydatetime(), as_of.to_pydatetime()))
+        self.assertEqual(result["stations"].loc[result["stations"]["Station ID"] == next(iter(STATIONS.values())), "Snapshots"].iloc[0], 1008)
 
     def test_dashboard_renders_all_validation_charts(self):
         from streamlit.testing.v1 import AppTest
@@ -73,13 +121,34 @@ class ValidationHistoryTests(unittest.TestCase):
         }
         with patch.dict("os.environ", {"DATABASE_URL": "unused"}), \
                 patch("src.monitoring.health_check.collect_health", return_value=health), \
-                patch("dashboard.manifest_history.fetch_validation_history", return_value=frame), \
+                patch("dashboard.manifest_history.fetch_dashboard_history", return_value={
+                    "hourly": frame,
+                    "routes": pd.DataFrame({
+                        "Route": ["Red"], "Predictions": [100],
+                        "Median predicted wait (min)": [8.0],
+                        "P90 predicted wait (min)": [15.0],
+                        "Reported delayed": [0], "Reported not delayed": [100],
+                        "Unknown delay flags": [0], "Reported delayed (%)": [0.0],
+                        "Unknown delay (%)": [0.0],
+                    }),
+                    "stations": pd.DataFrame({
+                        "Station": ["Wilson"], "Station ID": [40540],
+                        "Snapshots": [12], "Expected snapshots": [12.0],
+                        "Coverage (%)": [100.0], "Unprocessed files": [0],
+                        "Empty snapshots": [0], "Latest snapshot": [pd.Timestamp.now()],
+                    }),
+                    "window_start": pd.Timestamp("2026-10-06T05:00Z"),
+                    "as_of": pd.Timestamp("2026-10-06T07:00Z"),
+                }), \
                 patch("dashboard.manifest_history.fetch_manifest_history", return_value=pd.DataFrame()):
             app = AppTest.from_file(str(Path(__file__).resolve().parents[1] / "dashboard" / "app.py")).run(timeout=30)
         self.assertFalse(app.exception)
-        self.assertEqual([item.label for item in app.tabs], ["Coverage", "Consistency", "Source fields"])
+        self.assertEqual(app.selectbox[0].options, ["24 hours", "7 days", "30 days", "All history"])
+        self.assertEqual([item.label for item in app.tabs], ["Overview", "Collection", "Forecast behavior", "Data quality"])
+        self.assertGreaterEqual(len(app.get("vega_lite_chart")), 7)
+        self.assertIn("Clear", [item.value for item in app.metric])
         charts = app.get("vega_lite_chart") or app.get("arrow_vega_lite_chart")
-        self.assertEqual(len(charts), 7)
+        self.assertGreaterEqual(len(charts), 7)
 
 
 if __name__ == "__main__":

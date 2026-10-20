@@ -74,7 +74,7 @@ class RecoveryLoggingTests(unittest.TestCase):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
         self.mocks = {}
-        for name in ("logger", "_clients", "_inventory", "_manifest", "_repair_counts", "parse_arrivals", "load_arrivals_data", "register_file_results", "archive_files"):
+        for name in ("logger", "_clients", "_inventory", "_manifest", "_repair_counts", "parse_arrivals", "load_arrivals_data", "register_file_results", "cleanup_staged_files"):
             patcher = patch("src.storage.self_heal." + name)
             self.mocks[name] = patcher.start()
             self.addCleanup(patcher.stop)
@@ -96,7 +96,7 @@ class RecoveryLoggingTests(unittest.TestCase):
         self.assertIn("event=recovery_completed", logger.info.call_args.args[0])
         self.assertTrue(any("event=recovery_file_completed" in call.args[0] for call in logger.info.call_args_list))
         logger.error.assert_not_called()
-        self.mocks["archive_files"].assert_called_once()
+        self.mocks["cleanup_staged_files"].assert_called_once()
 
     def test_each_failure_stage_uses_error_without_logging_credentials(self):
         stages = ("download", "parse", "load", "empty_registration")
@@ -123,7 +123,7 @@ class RecoveryLoggingTests(unittest.TestCase):
                 self.assertNotIn("secret", str(logger.mock_calls))
                 self.assertNotIn("secret", str(self.mocks["register_file_results"].call_args_list))
                 self.assertEqual(sum(result[key] for key in ("parse_failures", "download_failures", "load_failures")), 1)
-                self.mocks["archive_files"].assert_not_called()
+                self.mocks["cleanup_staged_files"].assert_not_called()
 
     def test_dry_run_logs_candidates_without_downloads_or_writes(self):
         with patch("src.storage.self_heal.DRY_RUN", True):
@@ -161,7 +161,7 @@ class PipelineFailureTests(unittest.TestCase):
         self.assertNotIn("secret", str(get_logger.return_value.mock_calls))
 
     @patch("src.pipeline.logger")
-    @patch("src.pipeline.archive_files")
+    @patch("src.pipeline.cleanup_staged_files")
     @patch("src.pipeline.register_file_results")
     @patch("src.pipeline.load_arrivals_data")
     def test_api_error_source_is_failed_not_processed_or_archived(self, load, register, archive, logger):
@@ -179,7 +179,7 @@ class PipelineFailureTests(unittest.TestCase):
         archive.assert_not_called()
 
     @patch("src.pipeline.logger")
-    @patch("src.pipeline.archive_files")
+    @patch("src.pipeline.cleanup_staged_files")
     @patch("src.pipeline.register_file_results")
     @patch("src.pipeline.parse_arrivals", return_value=pd.DataFrame())
     @patch("src.pipeline.fetch_arrivals", return_value=[Path("20261016_162119_Wilson.xml")])

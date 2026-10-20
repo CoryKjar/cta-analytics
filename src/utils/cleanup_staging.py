@@ -4,7 +4,7 @@ from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-def archive_files(files):
+def cleanup_staged_files(files):
     deleted = 0
 
     for file in files:

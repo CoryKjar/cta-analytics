@@ -37,9 +37,7 @@ Configure `.env` or deployment variables:
 
 The existing PostgreSQL schema, including its audit and monitoring tables, is required. This repository runs against that database; it does not bootstrap a fresh schema. Never commit credentials.
 
-Before deploying a version that stores CTA ETA source flags, apply [`migrations/20261019_add_cta_eta_source_flags.sql`](migrations/20261019_add_cta_eta_source_flags.sql) to the existing database. The nullable `is_scheduled` and `is_fault` columns preserve unknown source values. The production backfill from retained XML is complete; per-file hashes and match/update counts are recorded in `public.arrival_source_flag_backfill`. Existing v1 source-resolution audit rows remain immutable and were not rewritten. Do not replay audited historical files through the regular loader to populate the new fields.
-
-The bounded backfill utility is `src.storage.backfill_eta_source_flags`. It defaults to a 100-file dry run; apply mode requires an explicit `--max-files` or `--all` and writes only the two flags plus a separate per-file ledger. It supports disjoint `--shard-count` / `--shard-index` runs for parallel processing; use the same shard count for each worker and distinct indices. The runner requires `BACKFILL_DATABASE_URL` (or `DATABASE_PUBLIC_URL`/`DATABASE_URL`) and the normal bucket settings. Deploy the updated collector to populate both fields for newly collected arrivals.
+The arrivals schema requires nullable `is_scheduled` and `is_fault` columns. Production schema migration and the backfill from retained XML are complete; per-file hashes and match/update counts are recorded in `public.arrival_source_flag_backfill`. Existing v1 source-resolution audit rows remain immutable and were not rewritten. The updated collector is deployed and stores both flags for new arrivals. Do not replay audited historical files through the regular loader to populate the new fields.
 
 ## Entry Points
 
@@ -56,7 +54,7 @@ The scheduled collector, recovery and monitor entry points are unchanged. Collec
 
 Production schedules are collection and health checks every five minutes, with recovery hourly. Keep `SELF_HEAL_ENABLED=false` for ordinary collection when recovery is scheduled separately.
 
-The dashboard includes historical coverage, prediction volume, consistency violations, delay flags and coordinate-quality plots. Historical queries use a read-only consistent snapshot and cache results for five minutes; Refresh clears the cache. Empty station responses count toward coverage. Nominal coverage assumes 12 snapshots per configured station per full hour; partial boundary hours are excluded. Missing hours remain visible, unknown delay flags are not treated as false, and Chicago hour labels distinguish DST offsets. These plots show completeness and internal consistency, not proof that API forecasts match actual arrivals.
+The dashboard includes a 24-hour, 7-day, 30-day or full-history monitor for station coverage, prediction volume, consistency checks, forecast horizons, CTA-reported delay flags and coordinate availability. Historical queries use one read-only consistent database snapshot and cache results for five minutes; Refresh clears the cache. Empty station responses count toward coverage. Nominal coverage assumes 12 snapshots per configured station per full hour; partial boundary hours are excluded from hourly coverage. Missing hours remain visible, unknown delay flags are not treated as false, and Chicago hour labels distinguish DST offsets. Forecast horizons and reported flags describe CTA's prediction feed; without observed arrival outcomes, the plots do not measure prediction accuracy.
 
 ## Tests
 
