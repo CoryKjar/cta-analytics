@@ -75,6 +75,9 @@ class StationFreshnessTests(unittest.TestCase):
                 self.assertIn("collection_run_incomplete", health["issues"])
                 self.assertIn("partial_collection_run", health["issues"])
                 self.assertIn("stale-ru", health["issues"]["collection_run_incomplete"])
+                self.assertIn("no recorded completion", health["issues"]["collection_run_incomplete"])
+                self.assertIn("process activity unverified", health["issues"]["collection_run_incomplete"])
+                self.assertNotIn("still running after", health["issues"]["collection_run_incomplete"])
                 self.assertIn("58/143 uploaded", health["issues"]["partial_collection_run"])
                 self.assertEqual(health["recent_collection_runs"][0][5:7], (58, 1))
                 self.assertEqual(health["has_collection_retry_details"], retry_column_count == 2)
@@ -140,6 +143,42 @@ class HealthLoggingTests(unittest.TestCase):
         self.assertIn("detail=%s", logger.error.call_args_list[0].args[0])
         self.assertIn("event=health_check_completed", logger.error.call_args.args[0])
         self.assertTrue(any("event=health_email_sent" in call.args[0] for call in logger.info.call_args_list))
+
+    @patch("src.monitoring.health_check.logger")
+    @patch("src.monitoring.health_check.send_email")
+    @patch("src.monitoring.health_check.connect")
+    @patch("src.monitoring.health_check.collect_health")
+    def test_incomplete_run_alert_contains_details_and_unchanged_issue_stays_logged(self, collect, connect, send, logger):
+        detail = "Run 63c07775 has no recorded completion: 72/143 uploaded, 71 unfinished."
+        self.health["issues"] = {"collection_run_incomplete": detail}
+        collect.return_value = self.health
+        conn = connect.return_value.__enter__.return_value
+        conn.execute.return_value.fetchone.return_value = ("",)
+        evaluate_and_alert()
+        self.assertIn(detail, send.call_args.args[1])
+        self.assertIn(detail, logger.error.call_args_list[0].args)
+        conn.execute.return_value.fetchone.return_value = ("collection_run_incomplete",)
+        send.reset_mock()
+        logger.reset_mock()
+        evaluate_and_alert()
+        send.assert_not_called()
+        self.assertIn(detail, logger.error.call_args_list[0].args)
+        self.assertIn("event=health_check_completed", logger.error.call_args.args[0])
+
+    @patch("src.monitoring.health_check.logger")
+    @patch("src.monitoring.health_check.send_email")
+    @patch("src.monitoring.health_check.connect")
+    @patch("src.monitoring.health_check.collect_health")
+    def test_cleared_run_issue_sends_recovery_before_clearing_state(self, collect, connect, send, logger):
+        collect.return_value = self.health
+        conn = connect.return_value.__enter__.return_value
+        conn.execute.return_value.fetchone.return_value = ("collection_run_incomplete",)
+        evaluate_and_alert()
+        send.assert_called_once()
+        self.assertEqual(send.call_args.args[0], "[CTA RECOVERED] Pipeline health is clear")
+        self.assertIn("No monitored issues", send.call_args.args[1])
+        self.assertEqual(conn.execute.call_args.args[1], ("pipeline_health", "", True, True))
+        logger.error.assert_not_called()
 
     @patch("src.monitoring.health_check.logger")
     @patch("src.monitoring.health_check.collect_health", side_effect=RuntimeError("postgresql://private:secret@host/db"))

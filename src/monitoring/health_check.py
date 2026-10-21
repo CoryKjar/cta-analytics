@@ -235,8 +235,9 @@ def collect_health(*, collection_window_hours=24):
     if stale_collection_runs:
         run_id, started_at, expected, uploaded, failed, unfinished = stale_collection_runs[0]
         issues["collection_run_incomplete"] = (
-            f"Run {run_id[:8]} started at {started_at.isoformat()} is still running after "
-            f"{COLLECTION_RUN_STALE_MINUTES} minutes: {uploaded}/{expected} uploaded, "
+            f"Run {run_id[:8]} started at {started_at.isoformat()} has no recorded completion "
+            f"after the {COLLECTION_RUN_STALE_MINUTES}-minute threshold "
+            f"(ledger status: running; process activity unverified): {uploaded}/{expected} uploaded, "
             f"{failed} failed, {unfinished} pending/in progress."
         )
     if recent_partial_collection_runs:

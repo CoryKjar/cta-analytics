@@ -215,6 +215,45 @@ class ValidationHistoryTests(unittest.TestCase):
             health["has_collection_ledger"] = False
             app.run(timeout=30)
             self.assertTrue(any("Failed attempts" in item.value.columns for item in app.dataframe))
+            health["issues"] = {
+                "collection_run_incomplete": "Run 63c07775 has no recorded completion: 72/143 uploaded, 0 failed, 71 pending/in progress.",
+            }
+            health["stale_collection_runs"] = [(
+                "63c07775-e09e-4b2e-96ec-532d81c70c6c", pd.Timestamp("2026-10-20T04:20:37Z"),
+                143, 72, 0, 71,
+            )]
+            app.selectbox[0].select("24 hours").run(timeout=30)
+            self.assertFalse(app.exception)
+            self.assertEqual(len(app.error), 1)
+            self.assertIn("1 monitored issue(s)", app.error[0].value)
+            self.assertIn("72/143 uploaded", app.error[0].value)
+            self.assertIn("71 pending/in progress", app.error[0].value)
+            unresolved = [item.value for item in app.dataframe if "Unfinished" in item.value.columns]
+            self.assertEqual(len(unresolved), 1)
+            self.assertEqual(unresolved[0]["Run ID"].tolist(), ["63c07775-e09e-4b2e-96ec-532d81c70c6c"])
+            self.assertEqual(unresolved[0]["Started (Chicago)"].tolist(), ["2026-10-19 23:20:37 CDT"])
+            self.assertEqual(unresolved[0]["Uploaded"].tolist(), [72])
+            self.assertEqual(unresolved[0]["Unfinished"].tolist(), [71])
+            self.assertFalse(any("Pipeline checks are clear" in item.value for item in app.success))
+            health["stale_collection_runs"] = []
+            for key, detail in (
+                ("partial_collection_run", "Run partial-run ended partial: 72/143 uploaded, 1 failed."),
+                ("station_collection_stale", "Wilson has no fresh processed snapshot."),
+                ("failed_files", "1 file has status failed."),
+            ):
+                with self.subTest(issue=key):
+                    health["issues"] = {key: detail}
+                    app.run(timeout=30)
+                    self.assertFalse(app.exception)
+                    self.assertEqual(len(app.error), 1)
+                    self.assertIn(detail, app.error[0].value)
+                    self.assertFalse(any("Pipeline checks are clear" in item.value for item in app.success))
+            health["issues"] = {}
+            health["stale_collection_runs"] = []
+            app.run(timeout=30)
+            self.assertFalse(app.exception)
+            self.assertEqual(len(app.error), 0)
+            self.assertFalse(any("Unfinished" in item.value.columns for item in app.dataframe))
         self.assertFalse(app.exception)
         self.assertEqual(app.selectbox[0].options, ["24 hours", "7 days", "30 days", "All history"])
         self.assertEqual([item.label for item in app.tabs], ["Overview", "Collection", "Forecast behavior", "Data quality"])

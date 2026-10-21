@@ -1,6 +1,7 @@
 from datetime import datetime
 from pathlib import Path
 import os
+import signal
 import time
 import pandas as pd
 
@@ -32,6 +33,40 @@ def _register_failures(records):
 
 
 def main():
+    previous_handler = signal.getsignal(signal.SIGTERM)
+    shutdown_requested_at = None
+    started = time.monotonic()
+    completed = False
+
+    def request_shutdown(signum, frame):
+        nonlocal shutdown_requested_at
+        if shutdown_requested_at is None:
+            shutdown_requested_at = time.monotonic()
+
+    signal.signal(signal.SIGTERM, request_shutdown)
+    try:
+        _run_pipeline()
+        completed = True
+    finally:
+        signal.signal(signal.SIGTERM, previous_handler)
+        if shutdown_requested_at is not None:
+            logger.warning(
+                "event=pipeline_shutdown_requested signal=SIGTERM action=finish_current_run pid=%s duration_seconds=%.2f",
+                os.getpid(), shutdown_requested_at - started,
+            )
+            if completed:
+                logger.info(
+                    "event=pipeline_shutdown_completed pid=%s duration_seconds=%.2f",
+                    os.getpid(), time.monotonic() - started,
+                )
+            else:
+                logger.error(
+                    "event=pipeline_shutdown_incomplete pid=%s duration_seconds=%.2f",
+                    os.getpid(), time.monotonic() - started,
+                )
+
+
+def _run_pipeline():
     started = time.monotonic()
     logger.info("event=pipeline_started")
 
@@ -131,9 +166,12 @@ def main():
         cleanup_staged_files(safe_to_archive)
         logger.info("event=files_archived count=%s", len(safe_to_archive))
 
-    logger.info(
-        "event=pipeline_completed uploaded_files=%s loaded_files=%s zero_arrival_files=%s parse_failures=%s archived_files=%s arrival_rows=%s duration_seconds=%.2f",
-        len(fetched_files), len(successfully_loaded_files), len(successfully_empty_files),
+    incomplete = bool(parse_failures) or len(fetched_files) != len(STATIONS)
+    log_summary = logger.error if incomplete else logger.info
+    log_summary(
+        "event=%s uploaded_files=%s expected_files=%s loaded_files=%s zero_arrival_files=%s parse_failures=%s archived_files=%s arrival_rows=%s duration_seconds=%.2f",
+        "pipeline_incomplete" if incomplete else "pipeline_completed",
+        len(fetched_files), len(STATIONS), len(successfully_loaded_files), len(successfully_empty_files),
         len(parse_failures), len(safe_to_archive), loaded_rows, time.monotonic() - started,
     )
 

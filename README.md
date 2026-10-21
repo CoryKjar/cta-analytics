@@ -62,6 +62,25 @@ The dashboard includes a 24-hour, 7-day, 30-day or full-history monitor for stat
 
 The dashboard's Data quality tab shows up to 100 file processing issue records for the selected History window, including recorded failure counts, safe stage/error types, and last-update times. Parse failures are registered before database loading; load and empty-file registration failures are recorded per file when the database permits, without masking the original exception. Recovered files with previous failures remain visible, but their previous processing error may have been cleared by success. After the collection-attempt ledger migration is applied, Collection logs also shows up to 20 recent runs and 100 collection failures or request retries, with stage and safe error-code details. Displayed run totals come from the station attempt records, including interrupted runs whose completion counters were never written. Health-alert timing is independent of this display filter. If the ledger schema is absent, file processing issues remain available. Missing historical snapshots without an attempt record have no recorded failure reason.
 
+## Deployment Protection
+
+Keep the collector's five-minute cron schedule unchanged. Configure these variables only on the Railway `cta-analytics` collector service, not just in the local `.env`:
+
+```dotenv
+RAILWAY_DEPLOYMENT_OVERLAP_SECONDS=180
+RAILWAY_DEPLOYMENT_DRAINING_SECONDS=120
+```
+
+Overlap delays removal of the old deployment while the replacement becomes available. The draining period gives the old process time between SIGTERM and SIGKILL. The pipeline handles SIGTERM by recording one shutdown request and allowing the current collection, parsing, loading and cleanup to finish. The handler only records a flag and timestamp; request and outcome logs are emitted afterward to avoid reentrant logging from a signal handler. Repeated SIGTERM signals do not start another run or reset the platform deadline. Exceptions still fail the job, and the previous signal handler is restored when the pipeline exits. SIGKILL and host failures cannot be handled.
+
+These are bounded protection settings, not a deployment lock or a guarantee of uninterrupted collection. Production logs inspected on October 20 covered 240 completed full pipelines, averaging 60 seconds with a maximum of 79.44 seconds. Recheck duration as the workload changes. Railway's cron documentation says an execution still active at the next scheduled time can cause that next execution to be skipped; verify overlap behavior with a real collector rollout rather than assuming web-service behavior applies unchanged.
+
+Roll out the first protected version after confirming the previous pipeline finished; the old code does not have the new signal handler. Once protection is active, verify a subsequent deployment during a run: the old pipeline must finish, all 143 station snapshots must be processed, and the next scheduled run must complete normally without duplicate collection. Do not pause or edit the cron schedule. Stage configuration without triggering a deployment until the shutdown code is ready.
+
+Current dashboard issues show their full descriptions above every tab, independent of the History selection. Open runs past `COLLECTION_RUN_STALE_MINUTES` also appear in an unresolved-run table even when they fall outside the latest 20 log rows. An overdue ledger record means completion was not recorded; it does not prove its worker is still active. The monitor logs each issue at ERROR and sends detailed emails when the issue-type set changes, then a recovery email once checks are clear. SMTP acceptance is not proof of inbox delivery.
+
+Reconcile abandoned runs only after confirming the old worker stopped and checking retained XML against processed files. Preserve uploaded outcomes, distinguish an interrupted attempt from stations never started, and close the run as partial rather than completed. Do not fabricate missing snapshots or an exact finish time. There is no automatic age-only closure, and no runtime schema change is required for shutdown protection.
+
 ## Tests
 
 ```powershell
@@ -79,6 +98,9 @@ The local file rotates at 5 MB and retains three backups (`pipeline.log.1` throu
 Filter service logs using these event names:
 
 - `event=file_parse_failed` or `event=pipeline_failed`: collector failures.
+- `event=pipeline_incomplete`: ERROR summary for a partial collection or parsing failures, including uploaded versus expected file counts; not reported as `pipeline_completed`.
+- `event=pipeline_shutdown_requested`: WARNING that SIGTERM was received and the active pipeline is being allowed to finish.
+- `event=pipeline_shutdown_completed` or `event=pipeline_shutdown_incomplete`: whether a shutdown-requested pipeline finished successfully or raised; a force-killed process may emit neither and needs ledger investigation.
 - `event=arrivals_loaded`: committed prediction rows and file count.
 - `event=recovery_file_failed`: filename, failed stage and safe error type.
 - `event=recovery_file_completed`: successfully loaded or empty snapshot.

@@ -1,5 +1,6 @@
 import os
 import runpy
+import signal
 import subprocess
 import sys
 import tempfile
@@ -28,6 +29,92 @@ class PipelineImportTests(unittest.TestCase):
             capture_output=True, text=True, timeout=30,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
+
+
+class PipelineShutdownTests(unittest.TestCase):
+    def test_real_signal_during_collection_or_load_preserves_pipeline_work(self):
+        for phase in ("collection", "load"):
+            with self.subTest(phase=phase), \
+                    patch.dict(os.environ, {"SELF_HEAL_ENABLED": "false"}), \
+                    patch("src.pipeline.STATIONS", {"Wilson": 40540}), \
+                    patch("src.pipeline.logger") as logger, \
+                    patch("src.pipeline.fetch_arrivals") as fetch, \
+                    patch("src.pipeline.parse_arrivals") as parse, \
+                    patch("src.pipeline.load_arrivals_data") as load, \
+                    patch("src.pipeline.cleanup_staged_files") as cleanup:
+                files = [Path("20261019_195500_Wilson.xml")]
+                fetch.return_value = files
+                parse.return_value = pd.DataFrame({"source_file": [files[0].name]})
+                previous_handler = signal.getsignal(signal.SIGTERM)
+
+                def notify_during_work(*args):
+                    signal.raise_signal(signal.SIGTERM)
+                    return files if phase == "collection" else None
+
+                if phase == "collection":
+                    fetch.side_effect = notify_during_work
+                else:
+                    load.side_effect = notify_during_work
+                main()
+                load.assert_called_once()
+                cleanup.assert_called_once_with(files)
+                logger.warning.assert_called_once()
+                logger.error.assert_not_called()
+                self.assertIn("event=pipeline_shutdown_completed", logger.info.call_args.args[0])
+                self.assertIs(signal.getsignal(signal.SIGTERM), previous_handler)
+
+    @patch("src.pipeline.logger")
+    @patch("src.pipeline.signal.signal")
+    @patch("src.pipeline._run_pipeline")
+    def test_shutdown_finishes_work_and_restores_handler(self, work, set_handler, logger):
+        previous_handler = signal.getsignal(signal.SIGTERM)
+        finished = []
+
+        def run_work():
+            handler = set_handler.call_args_list[0].args[1]
+            handler(signal.SIGTERM, None)
+            handler(signal.SIGTERM, None)
+            logger.warning.assert_not_called()
+            finished.append(True)
+
+        work.side_effect = run_work
+        main()
+        self.assertEqual(finished, [True])
+        logger.warning.assert_called_once()
+        self.assertIn("event=pipeline_shutdown_requested", logger.warning.call_args.args[0])
+        self.assertIn("event=pipeline_shutdown_completed", logger.info.call_args.args[0])
+        logger.error.assert_not_called()
+        set_handler.assert_called_with(signal.SIGTERM, previous_handler)
+
+    @patch("src.pipeline.logger")
+    @patch("src.pipeline.signal.signal")
+    @patch("src.pipeline._run_pipeline")
+    def test_shutdown_does_not_hide_failure_or_log_private_details(self, work, set_handler, logger):
+        previous_handler = signal.getsignal(signal.SIGTERM)
+        failure = RuntimeError("postgresql://private:secret@host/db")
+
+        def run_work():
+            set_handler.call_args_list[0].args[1](signal.SIGTERM, None)
+            raise failure
+
+        work.side_effect = run_work
+        with self.assertRaises(RuntimeError) as caught:
+            main()
+        self.assertIs(caught.exception, failure)
+        self.assertIn("event=pipeline_shutdown_incomplete", logger.error.call_args.args[0])
+        self.assertNotIn("secret", str(logger.mock_calls))
+        logger.info.assert_not_called()
+        set_handler.assert_called_with(signal.SIGTERM, previous_handler)
+
+    @patch("src.pipeline.logger")
+    @patch("src.pipeline.signal.signal")
+    @patch("src.pipeline._run_pipeline")
+    def test_normal_run_does_not_log_shutdown(self, work, set_handler, logger):
+        main()
+        work.assert_called_once_with()
+        logger.warning.assert_not_called()
+        logger.info.assert_not_called()
+        logger.error.assert_not_called()
 
 
 class FetchResponseValidationTests(unittest.TestCase):
@@ -324,6 +411,10 @@ class PipelineFailureTests(unittest.TestCase):
                 main()
         register.assert_called_once()
         archive.assert_called_once()
+        logger.error.assert_called_once()
+        self.assertEqual(logger.error.call_args.args[1], "pipeline_incomplete")
+        self.assertEqual(logger.error.call_args.args[2:4], (1, 2))
+        self.assertFalse(any("pipeline_completed" in str(call) for call in logger.info.call_args_list))
 
     @patch("src.pipeline.logger")
     @patch("src.pipeline.load_arrivals_data")

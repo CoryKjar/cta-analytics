@@ -207,7 +207,21 @@ integrity_clear = bool(
 )
 
 if health["issues"]:
-    st.error(f"{len(health['issues'])} monitored issue(s): " + ", ".join(health["issues"]))
+    issue_details = "\n\n".join(
+        f"**{key.replace('_', ' ').capitalize()}**: {detail}"
+        for key, detail in sorted(health["issues"].items())
+    )
+    st.error(f"{len(health['issues'])} monitored issue(s)\n\n{issue_details}")
+    if health.get("stale_collection_runs"):
+        st.subheader("Unresolved collection runs")
+        unresolved_runs = pd.DataFrame(health["stale_collection_runs"], columns=[
+            "Run ID", "Started (Chicago)", "Expected stations", "Uploaded", "Failed", "Unfinished",
+        ])
+        started = pd.to_datetime(unresolved_runs["Started (Chicago)"], utc=True)
+        unresolved_runs["Started (Chicago)"] = started.dt.tz_convert("America/Chicago").dt.strftime(
+            "%Y-%m-%d %H:%M:%S %Z"
+        )
+        st.dataframe(unresolved_runs, use_container_width=True, hide_index=True)
 else:
     st.success("Pipeline checks are clear · all configured stations have a fresh processed snapshot")
 
