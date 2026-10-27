@@ -57,6 +57,7 @@ from src.transform.parse_arrivals import parse_arrivals
 from src.utils.cleanup_staging import cleanup_staged_files
 from src.utils.logger import get_logger
 from src.storage.object_storage import storage_error_details
+from src.storage.pending_uploads import drain_pending_uploads
 
 
 
@@ -267,6 +268,16 @@ def run_self_heal():
 def _run_self_heal():
     client, bucket, database_url = _clients()
 
+    pending = {"pending_archived": 0, "pending_failed": 0, "pending_remaining": 0}
+    try:
+        pending = drain_pending_uploads(
+            client, bucket, database_url, logger,
+            limit=MAX_FILES, max_attempts=MAX_ATTEMPTS, dry_run=DRY_RUN,
+        )
+    except Exception as exc:
+        # Ordinary bucket-to-database recovery still runs if the holding table is unavailable.
+        logger.error("event=pending_uploads_drain_failed error_type=%s", type(exc).__name__)
+
     logger.info("event=recovery_inventory_started")
 
     objects = _inventory(client, bucket)
@@ -314,7 +325,7 @@ def _run_self_heal():
 
         logger.info("event=recovery_dry_run_completed candidates=%s", len(candidates))
 
-        return {"candidates": len(candidates), "recovered": 0, "dry_run": True}
+        return {"candidates": len(candidates), "recovered": 0, "dry_run": True, **pending}
 
 
 
@@ -522,7 +533,7 @@ def _run_self_heal():
         stats["parse_failures"], stats["download_failures"], stats["load_failures"], len(repaired), skipped,
     )
 
-    return {"candidates": len(candidates), **stats, "row_counts_repaired": len(repaired)}
+    return {"candidates": len(candidates), **stats, "row_counts_repaired": len(repaired), **pending}
 
 
 

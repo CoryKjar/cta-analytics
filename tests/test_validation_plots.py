@@ -6,7 +6,7 @@ import pandas as pd
 
 from dashboard.manifest_history import (
     VALIDATION_COLUMNS, build_route_quality_frame, build_station_coverage_frame,
-    build_validation_history_frame, fetch_dashboard_history, fetch_validation_history,
+    build_validation_history_frame, fetch_dashboard_history,
 )
 from src.config.stations import STATIONS
 
@@ -87,7 +87,7 @@ class ValidationHistoryTests(unittest.TestCase):
         conn = connect.return_value.__enter__.return_value
         conn.execute.return_value.fetchone.return_value = (None, pd.Timestamp("2026-10-06T06:00Z"))
         conn.execute.return_value.fetchall.return_value = []
-        self.assertTrue(fetch_validation_history().empty)
+        self.assertTrue(fetch_dashboard_history(None)["hourly"].empty)
         self.assertEqual(conn.execute.call_args_list[0].args[0], "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
 
     @patch("dashboard.manifest_history.connect")
@@ -172,8 +172,7 @@ class ValidationHistoryTests(unittest.TestCase):
                     }),
                     "window_start": pd.Timestamp("2026-10-06T05:00Z"),
                     "as_of": pd.Timestamp("2026-10-06T07:00Z"),
-                }), \
-                patch("dashboard.manifest_history.fetch_manifest_history", return_value=pd.DataFrame()):
+                }):
             app = AppTest.from_file(str(Path(__file__).resolve().parents[1] / "dashboard" / "app.py")).run(timeout=30)
             collect.assert_called_with(collection_window_hours=168)
             file_logs = [item.value for item in app.dataframe if "Failed attempts" in item.value.columns]

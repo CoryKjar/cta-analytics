@@ -42,6 +42,10 @@ def get_bucket_client(*, max_pool_connections=10):
         region_name=region,
         config=Config(
             max_pool_connections=max_pool_connections,
+            # botocore defaults (60s timeouts, legacy retries) let slow uploads overrun the next cron slot.
+            connect_timeout=5,
+            read_timeout=15,
+            retries={"max_attempts": 3, "mode": "standard"},
             s3={
                 "addressing_style": "virtual"
             }

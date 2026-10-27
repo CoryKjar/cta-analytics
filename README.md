@@ -1,85 +1,132 @@
 # CTA Analytics
 
-Personal portfolio project collecting CTA arrival predictions into PostgreSQL, with recovery, health checks and a read-only dashboard.
+Personal portfolio project collecting CTA 'L' arrival predictions every five minutes into PostgreSQL, with raw XML archiving, recovery, health alerts and a read-only Streamlit dashboard.
 
 ## Project Layout
 
 ```text
-dashboard/                  Read-only Streamlit monitoring dashboard
 src/
-	pipeline.py               Scheduled collector entry point
-	ingestion/                CTA API collection and raw XML upload
+	pipeline.py               Collector entry point (Railway cron)
+	worker.py                 Optional persistent collector
+	config/                   Station list
+	ingestion/                CTA API requests and raw XML upload
 	transform/                XML parsing and source-conflict policy
-	storage/                  Live database loader, bucket access, audit writes and recovery
-	monitoring/               Scheduled health checks and email alerts
-tests/                      Mocked regression tests
-docs/                       Historical production repair record
-data/                       Local data and generated reports
-logs/                       Local logs, checkpoints and retained backups
+	storage/                  Database loader, collection ledger, bucket access, held uploads, recovery
+	monitoring/               Health checks, email alerts and collection gap report
+	utils/                    Logging and staging cleanup
+dashboard/                  Read-only monitoring dashboard
+migrations/                 Additive SQL migrations, applied manually
+tests/                      Mocked unit tests
 ```
-
-The parser also verifies original XML for audited replays. The small source-conflict policy module prevents arbitrary values being chosen when predictions disagree; the loader preserves the evidence in `public.arrival_resolution_audit`.
 
 ## Setup
 
-Use Python 3.12 or newer and install the project dependencies in an isolated environment:
+Use Python 3.12 or newer in an isolated environment:
 
 ```powershell
 python -m pip install -r requirements.txt
 ```
 
-Configure `.env` or deployment variables:
+Configure `.env` or deployment variables (never commit credentials):
 
 - Collection: `CTA_API_KEY`.
 - Database: `DATABASE_URL`.
 - Bucket: `BUCKET`, `ENDPOINT`, `ACCESS_KEY_ID`, `SECRET_ACCESS_KEY`; optional `REGION`.
 - Email alerts: `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD`, `ALERT_FROM_EMAIL`, `ALERT_TO_EMAIL`.
 
-The existing PostgreSQL schema, including its audit and monitoring tables, is required. This repository runs against that database; it does not bootstrap a fresh schema. Never commit credentials.
+The project runs against the existing production schema and does not bootstrap a fresh database. No runtime code creates or alters tables. Apply migrations in order:
 
-Before deploying the collection-attempt ledger, apply [`migrations/20261020_add_collection_attempt_ledger.sql`](migrations/20261020_add_collection_attempt_ledger.sql). It records a run and a pending attempt for every configured station before collection begins; station rows advance through request, validation and upload stages. Ledger writes are best-effort, so a missing/unavailable ledger does not prevent snapshot collection. `COLLECTION_RUN_STALE_MINUTES` (default 15) controls both the age threshold for open runs and the lookback for completed partial/failed-run alerts; the dashboard History filter is independent. At the five-minute cadence, the attempt table can grow by about 41,000 rows per day; set an appropriate retention policy for long-running deployments. Error fields store types and safe status codes, not exception messages, request URLs or credentials.
+1. [`20261020_add_collection_attempt_ledger.sql`](migrations/20261020_add_collection_attempt_ledger.sql): one run row and one row per station per collection (about 41,000 rows/day; plan retention). Ledger writes are best-effort and never block collection.
+2. [`20261020_add_collection_retry_context.sql`](migrations/20261020_add_collection_retry_context.sql): keeps the last retry's HTTP status and error type. Until applied, the collector logs `collection_retry_context_unavailable reason=migration_required` and the dashboard marks retry context unavailable.
+3. [`20261027_add_pending_uploads.sql`](migrations/20261027_add_pending_uploads.sql): holds validated XML when a bucket upload fails. Until applied, those responses are discarded and logged as `event=pending_upload_unavailable`.
 
-Then apply [`migrations/20261020_add_collection_retry_context.sql`](migrations/20261020_add_collection_retry_context.sql) to retain the last retry's HTTP status and error type separately from the final response. A recovered HTTP 503 retry can therefore remain visible alongside a final HTTP 200. Only the last retry failure is retained, not a full retry event history. Until this additive migration is applied, the existing ledger still works, but the collector logs a migration warning and the dashboard marks retry context unavailable. No runtime code creates or alters tables.
-
-The arrivals schema requires nullable `is_scheduled` and `is_fault` columns. Production schema migration and the backfill from retained XML are complete; per-file hashes and match/update counts are recorded in `public.arrival_source_flag_backfill`. Existing v1 source-resolution audit rows remain immutable and were not rewritten. The updated collector is deployed and stores both flags for new arrivals. Do not replay audited historical files through the regular loader to populate the new fields.
+Error fields store exception types and safe status codes, never messages, URLs or credentials.
 
 ## Entry Points
 
-Run commands from the project root using the configured project environment:
+Run from the project root:
 
 ```powershell
-python -m src.pipeline
-python -m src.storage.self_heal
-python -m src.monitoring.health_check
-python -m streamlit run dashboard/app.py
+python -m src.pipeline                               # one collection (Railway cron */5)
+python -m src.storage.self_heal                      # recovery (Railway cron hourly)
+python -m src.monitoring.health_check                # health check and alerts (Railway cron */5)
+python -m src.monitoring.collection_gaps --hours 24  # read-only gap report
+python -m src.worker                                 # optional persistent collector
+python -m streamlit run dashboard/app.py             # read-only dashboard
 ```
 
-The scheduled collector, recovery and monitor entry points are unchanged. Collection and recovery write bucket/database data; the health command may send alerts and writes monitoring state. The dashboard is read-only.
+Keep `SELF_HEAL_ENABLED=false` on the collector because recovery runs as its own service.
 
-Production schedules are collection and health checks every five minutes, with recovery hourly. Keep `SELF_HEAL_ENABLED=false` for ordinary collection when recovery is scheduled separately.
+## Collection Lifecycle
 
-The dashboard includes a 24-hour, 7-day, 30-day or full-history monitor for station coverage, prediction volume, consistency checks, forecast horizons, CTA-reported delay flags and coordinate availability. Historical queries use one read-only consistent database snapshot and cache results for five minutes; Refresh clears the cache. Empty station responses count toward coverage. Nominal coverage assumes 12 snapshots per configured station per full hour; partial boundary hours are excluded from hourly coverage. Missing hours remain visible, unknown delay flags are not treated as false, and Chicago hour labels distinguish DST offsets. Forecast horizons and reported flags describe CTA's prediction feed; without observed arrival outcomes, the plots do not measure prediction accuracy.
+For each configured station the collector requests CTA predictions (three attempts with bounded backoff), rejects API error responses, writes the XML locally and uploads it to `raw/YYYY/MM/DD/` in the bucket. Only after uploading does it parse and load predictions in one transaction, register valid empty responses as processed, and clean up staging. Every station's stage and outcome is recorded in `collection_runs` / `collection_attempts`.
 
-The dashboard's Data quality tab shows up to 100 file processing issue records for the selected History window, including recorded failure counts, safe stage/error types, and last-update times. Parse failures are registered before database loading; load and empty-file registration failures are recorded per file when the database permits, without masking the original exception. Recovered files with previous failures remain visible, but their previous processing error may have been cleared by success. After the collection-attempt ledger migration is applied, Collection logs also shows up to 20 recent runs and 100 collection failures or request retries, with stage and safe error-code details. Displayed run totals come from the station attempt records, including interrupted runs whose completion counters were never written. Health-alert timing is independent of this display filter. If the ledger schema is absent, file processing issues remain available. Missing historical snapshots without an attempt record have no recorded failure reason.
+The loader is idempotent: it uses the `arrivals` uniqueness constraint, recalculates manifest row counts, and requires the original XML for files with source conflicts or existing audits (`public.arrival_resolution_audit`). Do not replay audited historical files through the regular loader.
 
-## Deployment Protection
+## Collection Reliability
 
-Keep the collector's five-minute cron schedule unchanged. Configure these variables only on the Railway `cta-analytics` collector service, not just in the local `.env`:
+A collection interval is a UTC-aligned five-minute window matching cron `*/5`. It is collected when a ledger run started in that window and every station's XML was archived; valid empty responses count. Detection reads only `collection_runs`, `collection_attempts` and `ingestion_files`, so it survives restarts. States from the gap report and health check:
+
+- `missed` / `previous_run_still_active`: Railway skipped the tick because the previous execution was still running.
+- `missed` / `not_started`: no run and no processed files. The scheduler did not start the job, or the process failed before reaching the database; platform logs tell which.
+- `partial`, `failed`, `incomplete`: some or all stations were not archived, or completion was never recorded.
+- `awaiting_recovery`: every station's XML is archived or held, but some files are not yet loaded.
+- `unrecorded`: no ledger run, but processed files exist (ledger unavailable).
+
+History before the ledger started (2026-10-20) is not evaluated. During the fall-back DST hour the `unrecorded` cross-check can be off by an hour because source timestamps are naive Chicago times.
+
+Only archived or held XML is recoverable; processed files are never replayed. The CTA Train Tracker API serves only current predictions, so intervals without archived XML remain gaps. They are never zero-filled or reconstructed.
+
+Safeguards:
+
+- A PostgreSQL advisory lock allows one collector at a time across cron, worker and manual runs. A run is also skipped if another run in the same interval is `running` or `completed`; failed or partial runs may retry. Skips log `event=collection_skipped` and exit 0. If the database is unavailable, collection proceeds without these checks.
+- `COLLECTION_DEADLINE_SECONDS` (default 240) stops starting new stations so a slow run cannot occupy the next cron tick. Unstarted stations are recorded `not_attempted` / `DeadlineExceeded`.
+- Bucket uploads use 5 s connect / 15 s read timeouts and three standard-mode attempts.
+- Collector database connections (ledger, loader, held uploads) use `lock_timeout=30s` and `statement_timeout=120s`, so a stuck lock or query fails the run instead of blocking it.
+- If an upload fails after validation, the exact XML bytes (gzip) and SHA-256 are stored in `public.pending_uploads`. The station is recorded at stage `upload_deferred` and not loaded yet. Each recovery run first archives held rows, oldest first, to their original key and deletes a row only after the bucket copy's checksum matches. A different existing object is never overwritten (`ArchiveConflict`). The normal recovery inventory then loads the file. `PENDING_UPLOAD_MAX_ROWS` (default 40,000, about one day; October 26 XML averaged 2.9 KB, about 0.5 KB gzipped) caps the table. If the bucket and database are both unavailable, the response cannot be kept.
+- Optional `COLLECTION_HEARTBEAT_URL` (HTTPS only, never logged) is requested after each complete collection. Point it at an external dead-man's-switch service (for example Healthchecks.io or Cronitor; check their current terms) set to alert after about 15 minutes without a ping. The in-project monitor runs on the same platform and was also silent during the 2026-10-21 cron outage.
+
+## Health Checks and Alerts
+
+The monitor raises these issues, logs each at ERROR, emails when the set of issue types changes, and sends a recovery email once checks are clear (SMTP acceptance is not proof of delivery):
+
+- `collection_stale` / `station_collection_stale`: no processed snapshot within `COLLECTION_STALE_MINUTES` (default 15).
+- `collection_run_incomplete`: a run has no recorded completion after `COLLECTION_RUN_STALE_MINUTES` (default 15). This does not prove the process is still alive.
+- `partial_collection_run`: a run ended partial or failed within the same window.
+- `collection_interval_missed`: an interval in the last `COLLECTION_GAP_ALERT_MINUTES` (default 60) has no run.
+- `pending_uploads`: held XML older than `PENDING_UPLOAD_ALERT_MINUTES` (default 90) or at the retry cap.
+- `failed_files`, `processing_files`, `unexpected_statuses`, `retry_cap`, `row_count_mismatch`: manifest problems.
+
+## Recovery
+
+Recovery archives held uploads, then loads bucket XML that is missing from the manifest or not processed and below `SELF_HEAL_MAX_ATTEMPTS`. At most `SELF_HEAL_MAX_FILES` files are processed per run, in batches of `SELF_HEAL_BATCH_SIZE`. Valid empty files are registered processed. Download, parse and load failures are recorded and retried until the cap. Manifest `row_count` is reconciled from linked arrivals without inventing `processed_at`. Duplicate basenames under different keys stop recovery instead of guessing. `SELF_HEAL_DRY_RUN=true` reports candidates without writes. The bucket listing and database query are not one atomic snapshot, so expect brief discrepancies while collection is active.
+
+## Deployment
+
+Collector-service variables on Railway:
 
 ```dotenv
 RAILWAY_DEPLOYMENT_OVERLAP_SECONDS=180
 RAILWAY_DEPLOYMENT_DRAINING_SECONDS=120
 ```
 
-Overlap delays removal of the old deployment while the replacement becomes available. The draining period gives the old process time between SIGTERM and SIGKILL. The pipeline handles SIGTERM by recording one shutdown request and allowing the current collection, parsing, loading and cleanup to finish. The handler only records a flag and timestamp; request and outcome logs are emitted afterward to avoid reentrant logging from a signal handler. Repeated SIGTERM signals do not start another run or reset the platform deadline. Exceptions still fail the job, and the previous signal handler is restored when the pipeline exits. SIGKILL and host failures cannot be handled.
+On SIGTERM the collector records the request and lets the current collection, load and cleanup finish, then logs `pipeline_shutdown_completed` or `pipeline_shutdown_incomplete`. SIGKILL and host failures cannot be handled. Railway skips a cron execution while the previous one is still active.
 
-These are bounded protection settings, not a deployment lock or a guarantee of uninterrupted collection. Production logs inspected on October 20 covered 240 completed full pipelines, averaging 60 seconds with a maximum of 79.44 seconds. Recheck duration as the workload changes. Railway's cron documentation says an execution still active at the next scheduled time can cause that next execution to be skipped; verify overlap behavior with a real collector rollout rather than assuming web-service behavior applies unchanged.
+Reconcile abandoned runs only after confirming the old process stopped. Preserve uploaded outcomes, mark the run partial and never fabricate snapshots or finish times.
 
-Roll out the first protected version after confirming the previous pipeline finished; the old code does not have the new signal handler. Once protection is active, verify a subsequent deployment during a run: the old pipeline must finish, all 143 station snapshots must be processed, and the next scheduled run must complete normally without duplicate collection. Do not pause or edit the cron schedule. Stage configuration without triggering a deployment until the shutdown code is ready.
+### Optional Persistent Worker
 
-Current dashboard issues show their full descriptions above every tab, independent of the History selection. Open runs past `COLLECTION_RUN_STALE_MINUTES` also appear in an unresolved-run table even when they fall outside the latest 20 log rows. An overdue ledger record means completion was not recorded; it does not prove its worker is still active. The monitor logs each issue at ERROR and sends detailed emails when the issue-type set changes, then a recovery email once checks are clear. SMTP acceptance is not proof of inbox delivery.
+`python -m src.worker` runs the same pipeline once per UTC interval. It waits on a monotonic clock and realigns to wall-clock boundaries, so run time does not cause drift. It starts immediately if launched within 120 s of an interval start, with no burst catch-up. Cycle failures are logged and the loop continues; SIGTERM/SIGINT finish the current cycle, then stop. A watchdog exits the process with code 1 (`event=worker_cycle_timeout`) if one cycle exceeds `WORKER_CYCLE_TIMEOUT_SECONDS` (default 600), because Railway restarts only processes that exit. On startup it logs persisted gaps from the last `WORKER_STARTUP_GAP_HOURS` (default 6). It stays resident, so memory is billed continuously; locally it used about 119 MB after imports.
 
-Reconcile abandoned runs only after confirming the old worker stopped and checking retained XML against processed files. Preserve uploaded outcomes, distinguish an interrupted attempt from stations never started, and close the run as partial rather than completed. Do not fabricate missing snapshots or an exact finish time. There is no automatic age-only closure, and no runtime schema change is required for shutdown protection.
+To switch: remove the `cta-analytics` cron schedule, set the start command to `python -m src.worker` with restart policy `ON_FAILURE` (not `ALWAYS`, which would also restart after a clean deploy shutdown), and set `RAILWAY_DEPLOYMENT_DRAINING_SECONDS=300`. To roll back, restore `*/5 * * * *` and `python -m src.pipeline`. If both ever run, the lock and interval check make the second skip.
+
+## Dashboard
+
+The dashboard shows 24-hour, 7-day, 30-day or full-history station coverage, prediction volume, consistency checks, forecast horizons, CTA delay flags and coordinate availability. It also shows file processing issues and collection run/attempt logs. Queries use one read-only consistent snapshot and are cached for five minutes. Coverage assumes 12 snapshots per station per full hour, counts valid empty responses, and excludes partial boundary hours. Unknown flags are not treated as false, and Chicago hour labels include the DST offset.
+
+## Logging
+
+All components use a UTC logger: INFO/WARNING to stdout, ERROR to stderr, and a local `logs/pipeline.log` rotating at 5 MB with three backups. Railway container filesystems are not durable. Key events: `pipeline_completed`, `pipeline_incomplete`, `pipeline_failed`, `pipeline_skipped`, `collection_deadline_reached`, `pending_upload_stored`, `arrivals_loaded`, `recovery_completed`, `pending_uploads_drained`, `health_issue`, `health_email_sent`, `worker_cycle_finished`.
 
 ## Tests
 
@@ -87,44 +134,11 @@ Reconcile abandoned runs only after confirming the old worker stopped and checki
 python -B -m unittest discover -s tests -v
 ```
 
-Tests use mocked database/bucket clients and cover active parsing, train identity, loading, source conflicts, audit protection, health checks and logging. They do not execute live collection or recovery.
+Tests use mocks for the CTA API, database and bucket. They never touch production data and are not part of the deployed services.
 
-## Logging
+## Data Caveats
 
-Collection, loading, local cleanup, recovery and scheduled health checks use the same UTC timestamped logger. INFO/WARNING events go to stdout and ERROR events go to stderr, so Railway can distinguish normal activity from failures. Local output also goes to `logs/pipeline.log`.
-
-The local file rotates at 5 MB and retains three backups (`pipeline.log.1` through `.3`), approximately 20 MB total. Components share a file handler within a process; rotation is not coordinated between separate processes writing the same local path. Railway services have separate container filesystems, and local files are not durable unless storage is mounted. Railway console-log retention is separate.
-
-Filter service logs using these event names:
-
-- `event=file_parse_failed` or `event=pipeline_failed`: collector failures.
-- `event=pipeline_incomplete`: ERROR summary for a partial collection or parsing failures, including uploaded versus expected file counts; not reported as `pipeline_completed`.
-- `event=pipeline_shutdown_requested`: WARNING that SIGTERM was received and the active pipeline is being allowed to finish.
-- `event=pipeline_shutdown_completed` or `event=pipeline_shutdown_incomplete`: whether a shutdown-requested pipeline finished successfully or raised; a force-killed process may emit neither and needs ledger investigation.
-- `event=arrivals_loaded`: committed prediction rows and file count.
-- `event=recovery_file_failed`: filename, failed stage and safe error type.
-- `event=recovery_file_completed`: successfully loaded or empty snapshot.
-- `event=recovery_completed`: recovery counts, failures, repaired row counts and retry-cap skips; ERROR if failures or exhausted retries remain.
-- `event=health_check_completed` or `event=health_issue`: health summary and detected issue types.
-- `event=health_email_sent`: alert or recovery email accepted by the configured SMTP transport; not proof of inbox delivery.
-
-Dry runs emit `event=recovery_dry_run_completed` without writes. Operational failures log exception types rather than raw exception messages, signed URLs, connection strings or tracebacks. The manifest still stores the latest file outcome, not a complete attempt history. Logging does not change recovery selection, retry policy, health thresholds or email deduplication.
-
-## Recovery
-
-Start with `SELF_HEAL_DRY_RUN=true` to inspect candidates without writes. Before a write-enabled pilot, set it to `false`, set `SELF_HEAL_MAX_FILES=25` and `SELF_HEAL_BATCH_SIZE=25`, then run the recovery worker. Keep `SELF_HEAL_MAX_ATTEMPTS` finite so invalid files do not retry forever.
-
-## Behavior and limitations
-- Recovery candidates are Bucket XMLs absent from the manifest or with a non-processed status and attempts below the cap.
-- XMLs are downloaded to staging and parsed. Arrival-bearing files go through the existing idempotent loader; valid zero-arrival files are registered processed; parse/download failures are reported and retained for retry/investigation.
-- `row_count` is reconciled from actual linked arrivals for processed rows only. It does not fabricate `processed_at`.
-- The inventory uses basename because the current manifest schema uses `source_file`. Duplicate basenames under different Bucket keys stop recovery rather than choosing the wrong object.
-- A Bucket listing and live database query are not an atomic snapshot. Expect a few transient discrepancies while collection is active.
-- Source timestamps are Chicago-local CTA wall times; processing timestamps and logs are UTC instants.
-- Rows are predictions, not confirmed arrivals or passenger counts. `wait_time` is a forecast horizon, not measured waiting time. Account for historical collection gaps, unknown flags and missing coordinates in analytics.
-
-## Historical Repairs
-
-Completed migration/rebuild commands, duplicate manual replay tools and one-off verification scripts have been removed from the runtime project. Their last deployed implementations remain in Git commit `573f224`; do not rerun old backfills against the repaired database.
-
-The [production repair record](docs/production_repair_20261017.md), raw XML, database rollback tables, local backups and audit evidence are retained. This cleanup does not delete production data or alter deployment schedules.
+- Rows are CTA predictions, not observed arrivals or passenger counts. `wait_time` is a forecast horizon, not a measured wait.
+- Source timestamps are naive Chicago wall times; operational timestamps and logs are UTC.
+- Account for collection gaps, unknown delay flags and missing coordinates in analysis.
+- Historical repair tooling and the October 2026 repair record were removed from the working tree. They remain in Git history (`573f224`, `1b43627`); do not rerun old backfills. Production rollback tables and the server-side cutover dump were not touched by this cleanup.

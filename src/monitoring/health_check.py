@@ -5,17 +5,19 @@ Environment:
   SMTP_HOST, SMTP_PORT, SMTP_USERNAME, SMTP_PASSWORD
   ALERT_FROM_EMAIL, ALERT_TO_EMAIL
   COLLECTION_STALE_MINUTES=15
+  COLLECTION_GAP_ALERT_MINUTES=60
   MAX_ATTEMPTS=5
 """
 import os
 import smtplib
 from email.message import EmailMessage
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import psycopg
 from dotenv import load_dotenv
 from src.config.stations import STATIONS
+from src.monitoring.collection_gaps import find_collection_gaps
 from src.storage.collection_ledger import collection_retry_details_available
 from src.utils.logger import get_logger
 
@@ -25,6 +27,8 @@ logger = get_logger(__name__)
 STALE_MINUTES = int(os.getenv("COLLECTION_STALE_MINUTES", "15"))
 MAX_ATTEMPTS = int(os.getenv("SELF_HEAL_MAX_ATTEMPTS", "5"))
 COLLECTION_RUN_STALE_MINUTES = int(os.getenv("COLLECTION_RUN_STALE_MINUTES", "15"))
+COLLECTION_GAP_ALERT_MINUTES = int(os.getenv("COLLECTION_GAP_ALERT_MINUTES", "60"))
+PENDING_UPLOAD_ALERT_MINUTES = int(os.getenv("PENDING_UPLOAD_ALERT_MINUTES", "90"))
 
 
 def connect():
@@ -103,12 +107,25 @@ def collect_health(*, collection_window_hours=24):
         has_collection_ledger = conn.execute(
             "SELECT to_regclass('public.collection_runs')"
         ).fetchone()[0] is not None
+        pending_uploads = (0, None, 0)
+        if conn.execute("SELECT to_regclass('public.pending_uploads') IS NOT NULL").fetchone()[0]:
+            pending_uploads = conn.execute("""
+                SELECT COUNT(*)::bigint, MIN(created_at),
+                       COUNT(*) FILTER (WHERE attempts >= %s)::bigint
+                FROM public.pending_uploads
+            """, (MAX_ATTEMPTS,)).fetchone()
         stale_collection_runs = []
         recent_partial_collection_runs = []
         recent_collection_runs = []
         collection_attempt_logs = []
+        collection_gaps = []
         has_collection_retry_details = False
         if has_collection_ledger:
+            gap_end = datetime.now(timezone.utc)
+            collection_gaps = find_collection_gaps(
+                conn, start=gap_end - timedelta(minutes=COLLECTION_GAP_ALERT_MINUTES), end=gap_end,
+                now=gap_end, stale_after=timedelta(minutes=COLLECTION_RUN_STALE_MINUTES),
+            )
             has_collection_retry_details = collection_retry_details_available(conn)
             retry_columns = (
                 "a.last_retry_http_status, a.last_retry_error_type"
@@ -247,6 +264,24 @@ def collect_health(*, collection_window_hours=24):
             f"Run {run_id[:8]} at {started_at.isoformat()} ended {status}: "
             f"{uploaded}/{expected} uploaded, {failed} failed{fatal_detail}."
         )
+    missed = [gap for gap in collection_gaps if gap["state"] == "missed"]
+    if missed:
+        overlap = sum(gap["cause"] == "previous_run_still_active" for gap in missed)
+        issues["collection_interval_missed"] = (
+            f"{len(missed)} five-minute interval(s) in the last {COLLECTION_GAP_ALERT_MINUTES} minutes "
+            f"have no recorded collection run ({overlap} while a previous run was still active, "
+            f"{len(missed) - overlap} never started: scheduler or startup failure). "
+            f"First {missed[0]['interval_start'].isoformat()}, last {missed[-1]['interval_start'].isoformat()}. "
+            "Unless hourly recovery finds archived XML for them, these snapshots cannot be recovered."
+        )
+    pending_count, pending_oldest, pending_capped = pending_uploads
+    pending_age_minutes = (now - pending_oldest).total_seconds() / 60 if pending_oldest else 0.0
+    if pending_capped or (pending_count and pending_age_minutes > PENDING_UPLOAD_ALERT_MINUTES):
+        issues["pending_uploads"] = (
+            f"{pending_count} collected snapshot(s) are held in pending_uploads after bucket upload "
+            f"failures; oldest {pending_age_minutes:.0f} minutes, {pending_capped} at the "
+            f"{MAX_ATTEMPTS}-attempt retry cap. Recovery archives and loads them once the bucket accepts uploads."
+        )
     return {
         "checked_at": now,
         "latest_snapshot": latest,
@@ -262,6 +297,8 @@ def collect_health(*, collection_window_hours=24):
         "has_collection_retry_details": has_collection_retry_details,
         "recent_collection_runs": recent_collection_runs,
         "collection_attempt_logs": collection_attempt_logs,
+        "collection_gaps": collection_gaps,
+        "pending_upload_count": pending_count,
         "recent_updates": recent_updates,
         "issues": issues,
         "stale_stations": stale_stations,

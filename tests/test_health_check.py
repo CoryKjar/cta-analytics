@@ -46,6 +46,9 @@ class StationFreshnessTests(unittest.TestCase):
                 cursor.fetchone.return_value = ("collection_runs",)
             elif "information_schema.columns" in query:
                 cursor.fetchone.return_value = (retry_column_count,)
+            elif "gap_runs" in query or "SELECT MIN(started_at)" in query:
+                cursor.fetchall.return_value = []
+                cursor.fetchone.return_value = (None,)
             elif "FROM public.collection_runs AS r" in query and "LIMIT 20" in query:
                 cursor.fetchall.return_value = [(
                     "stale-run-1234", now - timedelta(minutes=20), None, "running",

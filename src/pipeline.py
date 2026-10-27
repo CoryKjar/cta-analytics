@@ -4,9 +4,11 @@ import os
 import signal
 import time
 import pandas as pd
+import requests
 
 from src.ingestion.fetch_arrivals import fetch_arrivals
 from src.transform.parse_arrivals import parse_arrivals
+from src.storage.collection_ledger import CollectionSkipped
 from src.storage.load_arrivals_postgres import load_arrivals_data, register_file_results
 from src.utils.cleanup_staging import cleanup_staged_files
 from src.utils.logger import get_logger
@@ -30,6 +32,22 @@ def _register_failures(records):
             "event=file_failure_registration_failed files=%s error_type=%s",
             len(records), type(exc).__name__,
         )
+
+
+def _send_heartbeat():
+    """Ping an external dead-man's switch; its silence alerts even if Railway stops all jobs."""
+    url = os.getenv("COLLECTION_HEARTBEAT_URL", "").strip()
+    if not url:
+        return
+    if not url.startswith("https://"):
+        logger.error("event=heartbeat_skipped reason=https_required")
+        return
+    try:
+        requests.get(url, timeout=(5, 10)).raise_for_status()
+        logger.info("event=heartbeat_sent")
+    except Exception as exc:
+        # The URL embeds a check token, so never log it or the exception text.
+        logger.error("event=heartbeat_failed error_type=%s", type(exc).__name__)
 
 
 def main():
@@ -175,6 +193,8 @@ def _run_pipeline():
         len(parse_failures), len(safe_to_archive), loaded_rows, time.monotonic() - started,
     )
 
+    if not incomplete:
+        _send_heartbeat()
 
     if parse_failures:
         raise RuntimeError(f"Collection completed with {len(parse_failures)} failed source files.")
@@ -185,6 +205,8 @@ def _run_pipeline():
 if __name__ == "__main__":
     try:
         main()
+    except CollectionSkipped as skipped:
+        logger.warning("event=pipeline_skipped reason=%s", skipped.reason)
     except Exception as exc:
         logger.error("event=pipeline_failed error_type=%s", type(exc).__name__)
         raise SystemExit(1) from None

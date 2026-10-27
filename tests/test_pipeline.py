@@ -221,13 +221,16 @@ class FetchResponseValidationTests(unittest.TestCase):
             ledger_class.return_value.station_uploaded.assert_called_once()
             ledger_class.return_value.finish.assert_called_once_with(
                 uploaded_count=1, failed_count=0, fatal_error_type=None,
+                not_attempted_reason=None,
             )
 
+    @patch("src.ingestion.fetch_arrivals.PendingUploadStore")
     @patch("src.ingestion.fetch_arrivals.CollectionAttemptLedger")
     @patch("src.ingestion.fetch_arrivals.logger")
     @patch("src.ingestion.fetch_arrivals.upload_file", side_effect=RuntimeError("private storage detail"))
     @patch("src.ingestion.fetch_arrivals.fetch_cta_response")
-    def test_upload_failure_records_safe_bucket_stage_and_object(self, fetch, upload, logger, ledger_class):
+    def test_upload_failure_records_safe_bucket_stage_and_object(self, fetch, upload, logger, ledger_class, store_class):
+        store_class.return_value.defer.return_value = False
         ledger_class.return_value.run_id = "test-run"
         fetch.return_value.text = "<ctatt><tmst>20261016 16:21:19</tmst><errCd>0</errCd></ctatt>"
         fetch.return_value.status_code = 200
@@ -245,6 +248,117 @@ class FetchResponseValidationTests(unittest.TestCase):
         self.assertEqual(failure["object_key"], "raw/2026/10/16/20261016_162119_Wilson.xml")
         self.assertNotIn("private storage detail", str(logger.error.call_args_list))
 
+    @patch("src.ingestion.fetch_arrivals.PendingUploadStore")
+    @patch("src.ingestion.fetch_arrivals.CollectionAttemptLedger")
+    @patch("src.ingestion.fetch_arrivals.logger")
+    @patch("src.ingestion.fetch_arrivals.upload_file", side_effect=RuntimeError("private storage detail"))
+    @patch("src.ingestion.fetch_arrivals.fetch_cta_response")
+    def test_bucket_failure_holds_xml_without_loading_it(self, fetch, upload, logger, ledger_class, store_class):
+        fetch.return_value.text = "<ctatt><tmst>20261016 16:21:19</tmst><errCd>0</errCd></ctatt>"
+        fetch.return_value.status_code = 200
+        store = store_class.return_value
+        held = []
+        store.defer.side_effect = lambda path, key: held.append((path.read_bytes(), key)) or True
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.dict(os.environ, {"CTA_API_KEY": "test-key"}), \
+                    patch("src.ingestion.fetch_arrivals.load_dotenv"), \
+                    patch("src.ingestion.fetch_arrivals.STATIONS", {"Wilson": 40540}), \
+                    patch("src.ingestion.fetch_arrivals.Path", return_value=Path(directory)):
+                self.assertEqual(fetch_arrivals(), [])
+            self.assertEqual(list(Path(directory).iterdir()), [])
+        self.assertEqual(held, [(fetch.return_value.text.encode(), "raw/2026/10/16/20261016_162119_Wilson.xml")])
+        self.assertEqual(ledger_class.return_value.station_failed.call_args.kwargs["stage"], "upload_deferred")
+        store.close.assert_called_once()
+
+    @patch("src.ingestion.fetch_arrivals.CollectionAttemptLedger")
+    @patch("src.ingestion.fetch_arrivals.logger")
+    @patch("src.ingestion.fetch_arrivals.upload_file")
+    @patch("src.ingestion.fetch_arrivals.fetch_cta_response")
+    def test_deadline_stops_new_stations_and_records_reason(self, fetch, upload, logger, ledger_class):
+        clock = [0.0]
+
+        def slow_response(*args, **kwargs):
+            clock[0] += 300
+            response = MagicMock(status_code=200)
+            response.text = "<ctatt><tmst>20261016 16:21:19</tmst><errCd>0</errCd></ctatt>"
+            return response
+
+        fetch.side_effect = slow_response
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.dict(os.environ, {"CTA_API_KEY": "test-key", "COLLECTION_DEADLINE_SECONDS": "240"}), \
+                    patch("src.ingestion.fetch_arrivals.load_dotenv"), \
+                    patch("src.ingestion.fetch_arrivals.time.monotonic", side_effect=lambda: clock[0]), \
+                    patch("src.ingestion.fetch_arrivals.STATIONS", {"Wilson": 40540, "Loyola": 41300, "Howard": 40900}), \
+                    patch("src.ingestion.fetch_arrivals.Path", return_value=Path(directory)):
+                uploaded = fetch_arrivals()
+        self.assertEqual(len(uploaded), 1)
+        self.assertEqual(fetch.call_count, 1)
+        ledger_class.return_value.finish.assert_called_once_with(
+            uploaded_count=1, failed_count=0, fatal_error_type=None,
+            not_attempted_reason="DeadlineExceeded",
+        )
+        self.assertIn("event=collection_deadline_reached", logger.error.call_args.args[0])
+
+    def test_bucket_client_has_bounded_timeouts_and_retries(self):
+        from src.storage.object_storage import get_bucket_client
+        with patch.dict(os.environ, {"ENDPOINT": "https://example.invalid", "ACCESS_KEY_ID": "x", "SECRET_ACCESS_KEY": "y"}), \
+                patch("src.storage.object_storage.load_dotenv"), \
+                patch("src.storage.object_storage.boto3.client") as client:
+            get_bucket_client()
+        config = client.call_args.kwargs["config"]
+        self.assertEqual((config.connect_timeout, config.read_timeout), (5, 15))
+        self.assertEqual(config.retries, {"max_attempts": 3, "mode": "standard"})
+
+
+class PipelineSkipAndHeartbeatTests(unittest.TestCase):
+    @patch("src.utils.logger.get_logger")
+    def test_skipped_collection_exits_cleanly_without_failure_log(self, get_logger):
+        from src.storage.collection_ledger import CollectionSkipped
+        with patch.dict(os.environ, {"SELF_HEAL_ENABLED": "false"}), \
+                patch("src.ingestion.fetch_arrivals.fetch_arrivals", side_effect=CollectionSkipped("collection_in_progress")):
+            runpy.run_path(str(Path(__file__).resolve().parents[1] / "src" / "pipeline.py"), run_name="__main__")
+        get_logger.return_value.error.assert_not_called()
+        get_logger.return_value.warning.assert_called_once_with(
+            "event=pipeline_skipped reason=%s", "collection_in_progress",
+        )
+
+    def _run(self, files, *, env):
+        with patch.dict(os.environ, {"SELF_HEAL_ENABLED": "false", **env}), \
+                patch("src.pipeline.STATIONS", {"Wilson": 40540, "Loyola": 41300}), \
+                patch("src.pipeline.fetch_arrivals", return_value=files), \
+                patch("src.pipeline.parse_arrivals", return_value=pd.DataFrame()), \
+                patch("src.pipeline.register_file_results"), \
+                patch("src.pipeline.cleanup_staged_files"), \
+                patch("src.pipeline.logger") as logger, \
+                patch("src.pipeline.requests.get") as get:
+            try:
+                main()
+            except RuntimeError:
+                pass
+        return get, logger
+
+    def test_heartbeat_only_after_complete_collection(self):
+        url = {"COLLECTION_HEARTBEAT_URL": "https://hc.example.invalid/private-token"}
+        complete = [Path("20261019_195500_Wilson.xml"), Path("20261019_195501_Loyola.xml")]
+        get, logger = self._run(complete, env=url)
+        get.assert_called_once()
+        self.assertIn("event=heartbeat_sent", logger.info.call_args.args[0])
+        get, _ = self._run(complete[:1], env=url)
+        get.assert_not_called()
+
+    def test_heartbeat_requires_https_and_never_logs_token(self):
+        complete = [Path("20261019_195500_Wilson.xml"), Path("20261019_195501_Loyola.xml")]
+        get, logger = self._run(complete, env={"COLLECTION_HEARTBEAT_URL": "http://hc.example.invalid/private-token"})
+        get.assert_not_called()
+        self.assertTrue(any("reason=https_required" in call.args[0] for call in logger.error.call_args_list))
+        with patch.dict(os.environ, {"COLLECTION_HEARTBEAT_URL": "https://hc.example.invalid/private-token"}), \
+                patch("src.pipeline.requests.get", side_effect=RuntimeError("https://hc.example.invalid/private-token")), \
+                patch("src.pipeline.logger") as logger:
+            from src.pipeline import _send_heartbeat
+            _send_heartbeat()
+        logger.error.assert_called_once_with("event=heartbeat_failed error_type=%s", "RuntimeError")
+        self.assertNotIn("private-token", str(logger.mock_calls))
+
 
 class RecoveryLoggingTests(unittest.TestCase):
     def setUp(self):
@@ -252,7 +366,7 @@ class RecoveryLoggingTests(unittest.TestCase):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
         self.mocks = {}
-        for name in ("logger", "_clients", "_inventory", "_manifest", "_repair_counts", "parse_arrivals", "load_arrivals_data", "register_file_results", "cleanup_staged_files"):
+        for name in ("logger", "_clients", "_inventory", "_manifest", "_repair_counts", "parse_arrivals", "load_arrivals_data", "register_file_results", "cleanup_staged_files", "drain_pending_uploads"):
             patcher = patch("src.storage.self_heal." + name)
             self.mocks[name] = patcher.start()
             self.addCleanup(patcher.stop)
@@ -266,6 +380,24 @@ class RecoveryLoggingTests(unittest.TestCase):
         self.mocks["_manifest"].return_value = ({}, [])
         self.mocks["_repair_counts"].return_value = []
         self.mocks["parse_arrivals"].return_value = pd.DataFrame()
+        self.mocks["drain_pending_uploads"].return_value = {
+            "pending_archived": 0, "pending_failed": 0, "pending_remaining": 0,
+        }
+
+    def test_held_xml_is_archived_before_inventory_and_drain_failure_is_isolated(self):
+        order = []
+        self.mocks["drain_pending_uploads"].side_effect = lambda *args, **kwargs: order.append("drain") or {
+            "pending_archived": 1, "pending_failed": 0, "pending_remaining": 0,
+        }
+        self.mocks["_inventory"].side_effect = lambda *args: order.append("inventory") or {self.name: "raw/2026/10/16/" + self.name}
+        result = run_self_heal()
+        self.assertEqual(order, ["drain", "inventory"])
+        self.assertEqual((result["pending_archived"], result["recovered_empty"]), (1, 1))
+        self.mocks["drain_pending_uploads"].side_effect = RuntimeError("postgresql://private:secret@host")
+        result = run_self_heal()
+        self.assertEqual(result["recovered_empty"], 1)
+        self.assertIn("event=pending_uploads_drain_failed", self.mocks["logger"].error.call_args_list[0].args[0])
+        self.assertNotIn("secret", str(self.mocks["logger"].mock_calls))
 
     def test_successful_empty_recovery_logs_file_and_info_summary(self):
         result = run_self_heal()
@@ -325,6 +457,22 @@ class RecoveryLoggingTests(unittest.TestCase):
         self.assertEqual(result["candidates"], 0)
         self.client.download_file.assert_not_called()
         self.assertIn("event=recovery_retry_cap_reached", self.mocks["logger"].warning.call_args.args[0])
+
+    def test_already_processed_archive_is_never_replayed(self):
+        self.mocks["_manifest"].return_value = ({self.name: {"status": "processed", "attempts": 0}}, [])
+        result = run_self_heal()
+        self.assertEqual(result["candidates"], 0)
+        self.client.download_file.assert_not_called()
+        self.mocks["load_arrivals_data"].assert_not_called()
+        self.mocks["register_file_results"].assert_not_called()
+
+    def test_archived_snapshot_missing_from_manifest_is_loaded_once(self):
+        frame = pd.DataFrame({"source_file": [self.name]})
+        self.mocks["parse_arrivals"].return_value = frame
+        result = run_self_heal()
+        self.assertEqual(result["recovered_with_arrivals"], 1)
+        self.client.download_file.assert_called_once_with("bucket", "raw/2026/10/16/" + self.name, str(Path(self.directory.name) / self.name))
+        self.mocks["load_arrivals_data"].assert_called_once()
 
 
 class PipelineFailureTests(unittest.TestCase):

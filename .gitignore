@@ -5,22 +5,9 @@
 __pycache__/
 *.pyc
 
-# Jupyter
-.ipynb_checkpoints/
-
-# VS Code
+# Editor
 .vscode/
 
-# Local installers
-*.exe
-
-# Data
-data/raw/
-data/processed/
-data/database/*.db
+# Local staging and logs
+data/
 logs/
-
-# Generated audit reports
-/bucket-output.txt
-/data/missing_bucket_files.txt
-/data/reconciliation_report.txt

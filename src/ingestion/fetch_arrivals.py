@@ -11,6 +11,7 @@ from dotenv import load_dotenv
 from src.config.stations import STATIONS
 from src.storage.object_storage import storage_error_details, upload_file
 from src.storage.collection_ledger import CollectionAttemptLedger
+from src.storage.pending_uploads import PendingUploadStore
 from src.transform.parse_arrivals import validate_cta_response
 
 from src.utils.logger import get_logger
@@ -74,9 +75,11 @@ def fetch_arrivals():
     started = time.monotonic()
     load_dotenv()
     ledger = CollectionAttemptLedger(STATIONS, logger)
+    pending_uploads = PendingUploadStore(logger)
     uploaded_files = []
     failed = 0
     fatal_error_type = None
+    not_attempted_reason = None
     logger.info("event=collection_started run_id=%s station_count=%s", ledger.run_id, len(STATIONS))
     try:
         api_key = os.getenv("CTA_API_KEY")
@@ -84,11 +87,19 @@ def fetch_arrivals():
             logger.critical("event=configuration_error missing_environment_variable=CTA_API_KEY")
             raise ValueError("CTA_API_KEY is not configured.")
 
+        deadline_seconds = float(os.getenv("COLLECTION_DEADLINE_SECONDS", "240"))
         url = "http://lapi.transitchicago.com/api/1.0/ttarrivals.aspx"
         output_folder = Path("data/raw/arrivals")
         output_folder.mkdir(parents=True, exist_ok=True)
 
         for index, (station_name, map_id) in enumerate(STATIONS.items(), start=1):
+            if time.monotonic() - started > deadline_seconds:
+                not_attempted_reason = "DeadlineExceeded"
+                logger.error(
+                    "event=collection_deadline_reached run_id=%s deadline_seconds=%.0f attempted=%s not_attempted=%s",
+                    ledger.run_id, deadline_seconds, index - 1, len(STATIONS) - index + 1,
+                )
+                break
             station_started = time.monotonic()
             request_attempts = [0]
             stage = "cta_request"
@@ -164,6 +175,9 @@ def fetch_arrivals():
                 response_status = getattr(getattr(exc, "response", None), "status_code", None)
                 http_status = http_status or response_status
                 storage_code, storage_status = storage_error_details(exc)
+                if stage == "bucket_upload" and pending_uploads.defer(local_path, object_key):
+                    stage = "upload_deferred"
+                    local_path.unlink(missing_ok=True)
                 duration = time.monotonic() - station_started
                 ledger.station_failed(
                     map_id, stage=stage, attempt_count=request_attempts[0],
@@ -192,10 +206,7 @@ def fetch_arrivals():
     finally:
         ledger.finish(
             uploaded_count=len(uploaded_files), failed_count=failed,
-            fatal_error_type=fatal_error_type,
+            fatal_error_type=fatal_error_type, not_attempted_reason=not_attempted_reason,
         )
         ledger.close()
-
-
-if __name__ == "__main__":
-    fetch_arrivals()
+        pending_uploads.close()

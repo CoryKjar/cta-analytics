@@ -4,6 +4,20 @@ from uuid import uuid4
 
 import psycopg
 
+# Shared by every collector process (cron, worker or manual) so only one collects at a time.
+COLLECTION_LOCK_KEY = 4_727_301_605
+COLLECTION_INTERVAL_SECONDS = 300
+# Collector write connections fail a stuck lock or query instead of blocking the run forever.
+DATABASE_TIMEOUT_OPTIONS = "-c lock_timeout=30s -c statement_timeout=120s"
+
+
+class CollectionSkipped(Exception):
+    """Another collector holds the lock, or this five-minute interval was already collected."""
+
+    def __init__(self, reason):
+        super().__init__(reason)
+        self.reason = reason
+
 
 def collection_retry_details_available(connection):
     return connection.execute("""
@@ -27,7 +41,25 @@ class CollectionAttemptLedger:
             database_url = os.getenv("DATABASE_URL")
             if not database_url:
                 raise ValueError("DATABASE_URL is not configured")
-            self.connection = psycopg.connect(database_url, connect_timeout=10)
+            self.connection = psycopg.connect(
+                database_url, connect_timeout=10, options=DATABASE_TIMEOUT_OPTIONS,
+            )
+            # Session lock: released when this connection closes, including process death.
+            if not self.connection.execute(
+                "SELECT pg_try_advisory_lock(%s)", (COLLECTION_LOCK_KEY,),
+            ).fetchone()[0]:
+                raise CollectionSkipped("collection_in_progress")
+            # Failed or partial runs do not block a retry in the same interval.
+            if self.connection.execute("""
+                SELECT EXISTS (
+                    SELECT 1 FROM public.collection_runs
+                    WHERE status IN ('running', 'completed')
+                      AND started_at >= to_timestamp(
+                          floor(extract(epoch FROM NOW()) / %s) * %s
+                      )
+                )
+            """, (COLLECTION_INTERVAL_SECONDS, COLLECTION_INTERVAL_SECONDS)).fetchone()[0]:
+                raise CollectionSkipped("interval_already_collected")
             with self.connection.cursor() as cursor:
                 cursor.execute("""
                     INSERT INTO public.collection_runs
@@ -58,10 +90,16 @@ class CollectionAttemptLedger:
                 self.run_id, self.expected_station_count,
                 os.getenv("RAILWAY_GIT_COMMIT_SHA", "unknown"),
             )
+        except CollectionSkipped as skipped:
+            self._close_connection()
+            self.logger.warning(
+                "event=collection_skipped run_id=%s reason=%s", self.run_id, skipped.reason,
+            )
+            raise
         except Exception as exc:
             self._disable("start", exc)
 
-    def _disable(self, stage, error):
+    def _close_connection(self):
         if self.connection is not None:
             try:
                 self.connection.rollback()
@@ -69,6 +107,9 @@ class CollectionAttemptLedger:
             except Exception:
                 pass
         self.connection = None
+
+    def _disable(self, stage, error):
+        self._close_connection()
         if self.enabled or stage == "start":
             self.logger.error(
                 "event=collection_ledger_unavailable run_id=%s stage=%s error_type=%s",
@@ -156,7 +197,7 @@ class CollectionAttemptLedger:
             self.run_id, station_id,
         ))
 
-    def finish(self, *, uploaded_count, failed_count, fatal_error_type=None):
+    def finish(self, *, uploaded_count, failed_count, fatal_error_type=None, not_attempted_reason=None):
         if not self.enabled:
             return
         if fatal_error_type:
@@ -172,7 +213,7 @@ class CollectionAttemptLedger:
             SET status='not_attempted', stage='not_started', error_type=%s,
                 completed_at=NOW()
             WHERE run_id=%s AND status='pending'
-        """, (fatal_error_type, self.run_id)):
+        """, (fatal_error_type or not_attempted_reason, self.run_id)):
             return
         if not self._execute("run_finish", """
             UPDATE public.collection_runs

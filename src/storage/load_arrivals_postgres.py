@@ -12,6 +12,7 @@ from src.transform.parse_arrivals import (
     parse_cta_boolean, parse_cta_run_number, source_prediction_records,
 )
 from src.transform.arrival_quality import resolve_unknowns
+from src.storage.collection_ledger import DATABASE_TIMEOUT_OPTIONS
 from src.storage.quality_audit import write_quality_audit
 from src.utils.logger import get_logger
 
@@ -52,7 +53,7 @@ def register_file_results(results):
         for item in results
     ]
 
-    with psycopg.connect(_database_url(), connect_timeout=15) as conn:
+    with psycopg.connect(_database_url(), connect_timeout=15, options=DATABASE_TIMEOUT_OPTIONS) as conn:
         with conn.cursor() as cursor:
             cursor.executemany(
                 """
@@ -146,7 +147,7 @@ def load_arrivals_data(df):
     df["run_number"] = df["run_number"].map(parse_cta_run_number)
 
     resolution_events = []
-    with psycopg.connect(_database_url(), connect_timeout=15) as conn:
+    with psycopg.connect(_database_url(), connect_timeout=15, options=DATABASE_TIMEOUT_OPTIONS) as conn:
         with conn.cursor() as cursor:
             cursor.execute("SELECT route_id, route_name FROM routes")
             route_map = {name: route_id for route_id, name in cursor.fetchall()}

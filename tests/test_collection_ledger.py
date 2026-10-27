@@ -2,7 +2,21 @@ import unittest
 from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
-from src.storage.collection_ledger import CollectionAttemptLedger
+from src.storage.collection_ledger import CollectionAttemptLedger, CollectionSkipped
+
+
+def answer_ledger_queries(connection, *, retry_columns=2, lock_acquired=True, interval_collected=False):
+    def execute(query, parameters=None):
+        result = MagicMock()
+        if "pg_try_advisory_lock" in query:
+            result.fetchone.return_value = (lock_acquired,)
+        elif "started_at >= to_timestamp" in query:
+            result.fetchone.return_value = (interval_collected,)
+        else:
+            result.fetchone.return_value = (retry_columns,)
+        return result
+    connection.execute.side_effect = execute
+    return connection
 
 
 class CollectionAttemptLedgerTests(unittest.TestCase):
@@ -10,8 +24,7 @@ class CollectionAttemptLedgerTests(unittest.TestCase):
     @patch("src.storage.collection_ledger.os.getenv")
     def test_retry_reason_survives_successful_upload(self, getenv, connect):
         getenv.side_effect = lambda key, default=None: "unused" if key == "DATABASE_URL" else default
-        connection = connect.return_value
-        connection.execute.return_value.fetchone.return_value = (2,)
+        connection = answer_ledger_queries(connect.return_value, retry_columns=2)
         cursor = connection.cursor.return_value.__enter__.return_value
         ledger = CollectionAttemptLedger({"Wilson": 40540}, MagicMock())
         ledger.record_retry_failure(40540, http_status=503, error_type="HTTPError")
@@ -29,8 +42,7 @@ class CollectionAttemptLedgerTests(unittest.TestCase):
     @patch("src.storage.collection_ledger.os.getenv")
     def test_missing_retry_migration_keeps_existing_ledger_enabled(self, getenv, connect):
         getenv.side_effect = lambda key, default=None: "unused" if key == "DATABASE_URL" else default
-        connection = connect.return_value
-        connection.execute.return_value.fetchone.return_value = (0,)
+        connection = answer_ledger_queries(connect.return_value, retry_columns=0)
         logger = MagicMock()
         ledger = CollectionAttemptLedger({"Wilson": 40540}, logger)
         cursor = connection.cursor.return_value.__enter__.return_value
@@ -46,7 +58,7 @@ class CollectionAttemptLedgerTests(unittest.TestCase):
         getenv.side_effect = lambda key, default=None: "unused" if key == "DATABASE_URL" else default
         for successful_finish_commits in (0, 1):
             with self.subTest(successful_finish_commits=successful_finish_commits):
-                connection = MagicMock()
+                connection = answer_ledger_queries(MagicMock())
                 connect.return_value = connection
                 logger = MagicMock()
                 ledger = CollectionAttemptLedger({"Wilson": 40540}, logger)
@@ -65,7 +77,7 @@ class CollectionAttemptLedgerTests(unittest.TestCase):
             "DATABASE_URL": "unused",
             "RAILWAY_GIT_COMMIT_SHA": "abc123",
         }.get(key, default)
-        connection = connect.return_value
+        connection = answer_ledger_queries(connect.return_value)
         cursor = connection.cursor.return_value.__enter__.return_value
         logger = MagicMock()
 
@@ -87,7 +99,7 @@ class CollectionAttemptLedgerTests(unittest.TestCase):
     @patch("src.storage.collection_ledger.os.getenv")
     def test_persists_failure_stage_and_finishes_partial_run(self, getenv, connect):
         getenv.side_effect = lambda key, default=None: "unused" if key == "DATABASE_URL" else default
-        connection = connect.return_value
+        connection = answer_ledger_queries(connect.return_value)
         cursor = connection.cursor.return_value.__enter__.return_value
         logger = MagicMock()
         ledger = CollectionAttemptLedger({"Wilson": 40540}, logger)
@@ -128,6 +140,76 @@ class CollectionAttemptLedgerTests(unittest.TestCase):
         self.assertIn("error_type=%s", logger.error.call_args.args[0])
         self.assertNotIn("secret", str(logger.mock_calls))
         connect.assert_called_once()
+
+    @patch("src.storage.collection_ledger.psycopg.connect")
+    @patch("src.storage.collection_ledger.os.getenv")
+    def test_overlapping_or_duplicate_interval_collection_is_skipped_without_writes(self, getenv, connect):
+        getenv.side_effect = lambda key, default=None: "unused" if key == "DATABASE_URL" else default
+        for options, reason in (
+            ({"lock_acquired": False}, "collection_in_progress"),
+            ({"interval_collected": True}, "interval_already_collected"),
+        ):
+            with self.subTest(reason=reason):
+                connection = answer_ledger_queries(MagicMock(), **options)
+                connect.return_value = connection
+                logger = MagicMock()
+                with self.assertRaises(CollectionSkipped) as raised:
+                    CollectionAttemptLedger({"Wilson": 40540}, logger)
+                self.assertEqual(raised.exception.reason, reason)
+                connection.cursor.assert_not_called()
+                connection.commit.assert_not_called()
+                connection.close.assert_called_once()
+                self.assertIn("event=collection_skipped", logger.warning.call_args.args[0])
+
+    @patch("src.storage.collection_ledger.psycopg.connect")
+    @patch("src.storage.collection_ledger.os.getenv")
+    def test_interval_check_allows_retry_after_failed_or_partial_run(self, getenv, connect):
+        getenv.side_effect = lambda key, default=None: "unused" if key == "DATABASE_URL" else default
+        connection = answer_ledger_queries(connect.return_value)
+        CollectionAttemptLedger({"Wilson": 40540}, MagicMock())
+        interval_query = next(
+            call.args[0] for call in connection.execute.call_args_list
+            if "started_at >= to_timestamp" in call.args[0]
+        )
+        self.assertIn("status IN ('running', 'completed')", interval_query)
+        self.assertNotIn("partial", interval_query)
+
+    @patch("src.storage.collection_ledger.psycopg.connect")
+    @patch("src.storage.collection_ledger.os.getenv")
+    def test_deadline_reason_is_recorded_for_unstarted_stations(self, getenv, connect):
+        getenv.side_effect = lambda key, default=None: "unused" if key == "DATABASE_URL" else default
+        connection = answer_ledger_queries(connect.return_value)
+        cursor = connection.cursor.return_value.__enter__.return_value
+        ledger = CollectionAttemptLedger({"Wilson": 40540, "Loyola": 41300}, MagicMock())
+        ledger.finish(uploaded_count=1, failed_count=0, not_attempted_reason="DeadlineExceeded")
+        pending_update, run_update = cursor.execute.call_args_list[-2:]
+        self.assertIn("status='not_attempted'", pending_update.args[0])
+        self.assertEqual(pending_update.args[1], ("DeadlineExceeded", ledger.run_id))
+        self.assertEqual(run_update.args[1][0], "partial")
+
+
+class CollectorDatabaseTimeoutTests(unittest.TestCase):
+    def test_collector_write_connections_bound_lock_waits_and_statements(self):
+        import pandas as pd
+        from src.storage import collection_ledger, load_arrivals_postgres, pending_uploads
+        from src.storage.collection_ledger import DATABASE_TIMEOUT_OPTIONS
+
+        self.assertIn("lock_timeout=30s", DATABASE_TIMEOUT_OPTIONS)
+        self.assertIn("statement_timeout=120s", DATABASE_TIMEOUT_OPTIONS)
+        record = {
+            "source_file": "20261019_195500_Wilson.xml", "collection_timestamp": pd.Timestamp("2026-10-19 19:55"),
+            "station_id": 40540, "status": "processed", "row_count": 0, "last_error": None,
+        }
+        with patch.dict("os.environ", {"DATABASE_URL": "postgresql://unused"}), \
+                patch.object(collection_ledger.psycopg, "connect") as connect:
+            answer_ledger_queries(connect.return_value)
+            CollectionAttemptLedger({"Wilson": 40540}, MagicMock())
+            with patch("src.storage.load_arrivals_postgres.load_dotenv"):
+                load_arrivals_postgres.register_file_results([record])
+            pending_uploads.PendingUploadStore(MagicMock()).defer(MagicMock(read_bytes=lambda: b"<ctatt/>"), "raw/x/y.xml")
+        self.assertTrue(connect.call_args_list)
+        for call in connect.call_args_list:
+            self.assertEqual(call.kwargs["options"], DATABASE_TIMEOUT_OPTIONS)
 
 
 if __name__ == "__main__":
