@@ -38,8 +38,15 @@ def connect():
     return psycopg.connect(url, connect_timeout=15)
 
 
-def collect_health(*, collection_window_hours=24):
-    """Return current health metrics. Does not modify ingestion data."""
+def collect_health(*, collection_window_hours=24, log_start=None, log_end=None):
+    """Return current health metrics. Does not modify ingestion data.
+
+    Log tables cover the last ``collection_window_hours``, further bounded by optional
+    aware ``log_start``/``log_end``; issue checks always reflect current status.
+    """
+    log_bounds = (
+        collection_window_hours, collection_window_hours, log_start, log_start, log_end, log_end,
+    )
     with connect() as conn:
         latest = conn.execute("""
             SELECT MAX(collection_timestamp AT TIME ZONE 'America/Chicago')
@@ -77,9 +84,11 @@ def collect_health(*, collection_window_hours=24):
             WHERE (status <> 'processed' OR attempts > 0 OR last_error IS NOT NULL)
               AND (%s::integer IS NULL OR collection_timestamp AT TIME ZONE 'America/Chicago'
                    >= NOW() - (%s * INTERVAL '1 hour'))
+              AND (%s::timestamptz IS NULL OR collection_timestamp AT TIME ZONE 'America/Chicago' >= %s)
+              AND (%s::timestamptz IS NULL OR collection_timestamp AT TIME ZONE 'America/Chicago' < %s)
             ORDER BY updated_at DESC
             LIMIT 100
-        """, (collection_window_hours, collection_window_hours)).fetchall()
+        """, log_bounds).fetchall()
 
         mismatch_count = conn.execute("""
             SELECT COUNT(*)::bigint
@@ -164,10 +173,12 @@ def collect_health(*, collection_window_hours=24):
                 FROM public.collection_runs AS r
                 LEFT JOIN public.collection_attempts AS a USING (run_id)
                 WHERE (%s::integer IS NULL OR r.started_at >= NOW() - (%s * INTERVAL '1 hour'))
+                  AND (%s::timestamptz IS NULL OR r.started_at >= %s)
+                  AND (%s::timestamptz IS NULL OR r.started_at < %s)
                 GROUP BY r.run_id
                 ORDER BY r.started_at DESC
                 LIMIT 20
-            """, (collection_window_hours, collection_window_hours)).fetchall()
+            """, log_bounds).fetchall()
             collection_attempt_logs = conn.execute(f"""
                 SELECT r.run_id::text, r.started_at, a.station_name, a.station_id,
                        a.station_index, a.status, a.stage, a.request_attempts,
@@ -177,10 +188,12 @@ def collect_health(*, collection_window_hours=24):
                 FROM public.collection_attempts AS a
                 JOIN public.collection_runs AS r USING (run_id)
                 WHERE (%s::integer IS NULL OR r.started_at >= NOW() - (%s * INTERVAL '1 hour'))
+                  AND (%s::timestamptz IS NULL OR r.started_at >= %s)
+                  AND (%s::timestamptz IS NULL OR r.started_at < %s)
                   AND (a.status <> 'uploaded' OR a.request_attempts > 1)
                 ORDER BY r.started_at DESC, a.station_index
                 LIMIT 100
-            """, (collection_window_hours, collection_window_hours)).fetchall()
+            """, log_bounds).fetchall()
 
     now = datetime.now(timezone.utc)
     age_minutes = None

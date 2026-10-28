@@ -2,6 +2,7 @@
 import json
 import os
 import sys
+from datetime import datetime, time, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -12,16 +13,25 @@ from dotenv import load_dotenv
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from dashboard.manifest_history import fetch_dashboard_history  # noqa: E402
+from dashboard.manifest_history import aggregate_daily, fetch_dashboard_history  # noqa: E402
 from dashboard.manifest_status import build_manifest_status_view  # noqa: E402
+from src.config.stations import STATIONS  # noqa: E402
 from src.monitoring.health_check import collect_health  # noqa: E402
 
 load_dotenv()
+CHICAGO = ZoneInfo("America/Chicago")
+X_TITLE = "Collection hour (Chicago)"
+PRESETS = {"6 hours": 6, "24 hours": 24, "7 days": 168, "30 days": 720, "All history": None}
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def monitoring_data(window_hours):
-    return fetch_dashboard_history(window_hours)
+def monitoring_data(window_hours, start=None, end=None, station_ids=None):
+    return fetch_dashboard_history(
+        window_hours,
+        start=datetime.fromisoformat(start) if start else None,
+        end=datetime.fromisoformat(end) if end else None,
+        station_ids=list(station_ids) if station_ids else None,
+    )
 
 
 def line_chart(frame, columns, *, height=270, percent=False):
@@ -45,7 +55,7 @@ def line_chart(frame, columns, *, height=270, percent=False):
             "encoding": {
                 "x": {
                     "field": "Hour index", "type": "quantitative",
-                    "title": "Collection hour (Chicago)", "scale": {"nice": False},
+                    "title": X_TITLE, "scale": {"nice": False},
                     "axis": {
                         "values": ticks,
                         "labelExpr": "(" + json.dumps(labels) + ")[datum.value]",
@@ -173,20 +183,54 @@ st.markdown('<div class="dash-note">Collection health, snapshot coverage and pre
 
 with st.sidebar:
     st.markdown("### Monitor window")
-    window_label = st.selectbox("History", ["24 hours", "7 days", "30 days", "All history"], index=1)
-    window_hours = {"24 hours": 24, "7 days": 168, "30 days": 720, "All history": None}[window_label]
+    window_label = st.selectbox("History", [*PRESETS, "Custom range"], index=2)
+    custom_start = custom_end = None
+    if window_label == "Custom range":
+        today = datetime.now(CHICAGO).date()
+        picked = st.date_input(
+            "Dates (Chicago)", value=(today - timedelta(days=7), today), max_value=today,
+        )
+        if not isinstance(picked, (tuple, list)) or len(picked) != 2:
+            st.info("Select a start and end date.")
+            st.stop()
+        custom_start = datetime.combine(picked[0], time.min, CHICAGO)
+        custom_end = datetime.combine(picked[1] + timedelta(days=1), time.min, CHICAGO)
+        window_hours = None
+        span_hours = (custom_end - custom_start).total_seconds() / 3600
+    else:
+        window_hours = PRESETS[window_label]
+        span_hours = window_hours or float("inf")
+    granularity = st.radio(
+        "Granularity", ["Hourly", "Daily"], index=0 if span_hours <= 168 else 1, horizontal=True,
+    )
+    station_names = st.multiselect(
+        "Stations", sorted(name.replace("_", " ") for name in STATIONS),
+        placeholder="All stations",
+    )
+    selected_station_ids = tuple(sorted(
+        station_id for name, station_id in STATIONS.items()
+        if name.replace("_", " ") in station_names
+    ))
+    route_filter_slot = st.empty()
     if st.button("Refresh", use_container_width=True):
         monitoring_data.clear()
         st.rerun()
-    st.caption("Historical quality calculations use a consistent, read-only database snapshot.")
+    st.caption("Historical quality calculations use a consistent, read-only database snapshot. Station filters apply to coverage, prediction and route views; health issues always show current status for all stations.")
 
 if not os.getenv("DATABASE_URL"):
     st.error("DATABASE_URL is not configured.")
     st.stop()
 
 try:
-    health = collect_health(collection_window_hours=window_hours)
-    data = monitoring_data(window_hours)
+    health = collect_health(
+        collection_window_hours=window_hours, log_start=custom_start, log_end=custom_end,
+    )
+    data = monitoring_data(
+        window_hours,
+        custom_start.isoformat() if custom_start else None,
+        custom_end.isoformat() if custom_end else None,
+        selected_station_ids or None,
+    )
 except Exception as exc:
     st.error(f"Dashboard data unavailable ({type(exc).__name__}).")
     st.stop()
@@ -194,10 +238,21 @@ except Exception as exc:
 hourly = data["hourly"]
 routes = data["routes"]
 stations = data["stations"]
-latest = health["latest_snapshot"]
-latest_text = latest.astimezone(ZoneInfo("America/Chicago")).strftime("%b %d · %H:%M %Z") if latest else "No snapshots"
+with route_filter_slot:
+    route_names = st.multiselect(
+        "Routes", sorted(routes["Route"]) if not routes.empty else [], placeholder="All routes",
+    )
+if route_names:
+    routes = routes[routes["Route"].isin(route_names)]
 coverage_values = hourly["Coverage (%)"].dropna() if not hourly.empty else pd.Series(dtype=float)
 avg_coverage = f"{coverage_values.mean():.1f}%" if not coverage_values.empty else "N/A"
+if granularity == "Daily":
+    hourly = aggregate_daily(hourly)
+    X_TITLE = "Collection day (Chicago)"
+period = "day" if granularity == "Daily" else "hour"
+station_scope = f"{len(selected_station_ids)} selected station(s)" if selected_station_ids else "all configured stations"
+latest = health["latest_snapshot"]
+latest_text = latest.astimezone(ZoneInfo("America/Chicago")).strftime("%b %d · %H:%M %Z") if latest else "No snapshots"
 integrity_clear = bool(
     hourly.empty or (
         hourly["Invalid prediction rows"].sum() == 0
@@ -235,7 +290,8 @@ metrics[4].metric("Integrity checks", "Clear" if integrity_clear else "Review")
 st.caption(
     f"Window: {data['window_start'].astimezone(ZoneInfo('America/Chicago')):%Y-%m-%d %H:%M}"
     f" to {data['as_of'].astimezone(ZoneInfo('America/Chicago')):%Y-%m-%d %H:%M} · "
-    "Coverage expectation is 12 snapshots per configured station per full hour; partial edge hours are excluded."
+    "Coverage expectation is 12 snapshots per station per full hour for " + station_scope
+    + "; partial edge hours are excluded."
 )
 
 overview, collection, forecast, quality_tab = st.tabs(["Overview", "Collection", "Forecast behavior", "Data quality"])
@@ -267,7 +323,7 @@ with overview:
 with collection:
     coverage_column, empty_column = st.columns(2)
     with coverage_column:
-        st.subheader("Full-hour polling coverage")
+        st.subheader("Full-hour polling coverage" if period == "hour" else "Daily polling coverage (full hours)")
         if not hourly.empty:
             line_chart(hourly, "Coverage (%)", height=300, percent=True)
     with empty_column:
@@ -284,7 +340,9 @@ with forecast:
     with wait_column:
         st.subheader("Predicted wait horizon over time")
         st.caption("Median and 90th percentile of predicted arrival minus prediction time. These are forecast lead times, not observed waits.")
-        if not hourly.empty:
+        if period == "day":
+            st.info("Percentiles cannot be combined across hours; switch to Hourly granularity for this chart.")
+        elif not hourly.empty:
             line_chart(hourly, ["Wait median (min)", "Wait p90 (min)"], height=300)
     with delay_column:
         st.subheader("Reported delay rate by route")
@@ -336,7 +394,12 @@ with quality_tab:
                 bar_chart(status_frame, "Status", "Files", height=190)
 
         st.subheader("Collection logs")
-        collection_period = "across all history" if window_hours is None else f"in the last {window_label}"
+        if custom_start:
+            collection_period = f"from {custom_start:%Y-%m-%d} to {custom_end - timedelta(days=1):%Y-%m-%d}"
+        elif window_hours is None:
+            collection_period = "across all history"
+        else:
+            collection_period = f"in the last {window_label}"
         file_issue_rows = health.get("file_issue_logs", [])
         if file_issue_rows:
             st.markdown("**Files with processing issues**")

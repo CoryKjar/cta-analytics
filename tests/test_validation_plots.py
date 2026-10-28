@@ -82,6 +82,42 @@ class ValidationHistoryTests(unittest.TestCase):
         self.assertEqual(frame.loc[0, "Reported delayed (%)"], 25)
         self.assertEqual(frame.loc[0, "Unknown delay (%)"], 20)
 
+    def test_daily_aggregation_sums_counts_and_recomputes_rates(self):
+        from dashboard.manifest_history import aggregate_daily
+        rows = [
+            history_row("2026-10-06T05:00Z", snapshot_files=12, prediction_rows=10, delayed_rows=1, not_delayed_rows=9, median_wait=5),
+            history_row("2026-10-06T06:00Z", snapshot_files=6, prediction_rows=30, delayed_rows=9, not_delayed_rows=21),
+            history_row("2026-10-07T05:00Z", snapshot_files=12, prediction_rows=0),
+        ]
+        hourly = build_validation_history_frame(rows, "2026-10-06T05:00Z", "2026-10-07T05:30Z", 1)
+        daily = aggregate_daily(hourly)
+        first = daily.iloc[0]
+        self.assertEqual(daily["Hour"].tolist()[:2], ["2026-10-06", "2026-10-07"])
+        self.assertEqual(first["Predictions"], 40)
+        self.assertEqual(first["Reported delayed (%)"], 25)
+        self.assertEqual(first["Nominal snapshots"], 12 * 24)
+        self.assertAlmostEqual(first["Coverage (%)"], 100 * 18 / (12 * 24))
+        self.assertTrue(pd.isna(daily.iloc[-1]["Coverage (%)"]))
+        self.assertTrue(daily["Wait median (min)"].isna().all())
+
+    @patch("dashboard.manifest_history.connect")
+    def test_custom_range_and_station_filter_bound_every_query(self, connect):
+        conn = connect.return_value.__enter__.return_value
+        first = pd.Timestamp("2026-10-05T17:00Z")
+        now = pd.Timestamp("2026-10-27T20:00Z")
+        conn.execute.return_value.fetchone.return_value = (first, now.to_pydatetime())
+        conn.execute.return_value.fetchall.return_value = []
+        start = pd.Timestamp("2026-10-20T05:00Z").to_pydatetime()
+        end = pd.Timestamp("2026-10-22T05:00Z").to_pydatetime()
+        result = fetch_dashboard_history(None, start=start, end=end, station_ids=[41300, 40540])
+        bounded = [call.args[1] for call in conn.execute.call_args_list if len(call.args) > 1]
+        self.assertEqual(len(bounded), 3)
+        for parameters in bounded:
+            self.assertEqual(parameters, (start, end, [40540, 41300], [40540, 41300]))
+        self.assertEqual(set(result["stations"]["Station ID"]), {40540, 41300})
+        with self.assertRaises(ValueError):
+            fetch_dashboard_history(12)
+
     @patch("dashboard.manifest_history.connect")
     def test_fetch_uses_read_only_consistent_snapshot(self, connect):
         conn = connect.return_value.__enter__.return_value
@@ -117,7 +153,7 @@ class ValidationHistoryTests(unittest.TestCase):
         self.assertEqual(result["routes"].loc[0, "Reported delayed (%)"], 11.11111111111111)
         bounded_calls = [call for call in conn.execute.call_args_list if call.args[0] in (VALIDATION_HISTORY_QUERY,)]
         self.assertEqual(len(bounded_calls), 1)
-        self.assertEqual(bounded_calls[0].args[1], (first.to_pydatetime(), as_of.to_pydatetime()))
+        self.assertEqual(bounded_calls[0].args[1], (first.to_pydatetime(), as_of.to_pydatetime(), None, None))
         self.assertEqual(result["stations"].loc[result["stations"]["Station ID"] == next(iter(STATIONS.values())), "Snapshots"].iloc[0], 1008)
 
     def test_dashboard_renders_all_validation_charts(self):
@@ -174,7 +210,7 @@ class ValidationHistoryTests(unittest.TestCase):
                     "as_of": pd.Timestamp("2026-10-06T07:00Z"),
                 }):
             app = AppTest.from_file(str(Path(__file__).resolve().parents[1] / "dashboard" / "app.py")).run(timeout=30)
-            collect.assert_called_with(collection_window_hours=168)
+            collect.assert_called_with(collection_window_hours=168, log_start=None, log_end=None)
             file_logs = [item.value for item in app.dataframe if "Failed attempts" in item.value.columns]
             self.assertEqual(len(file_logs), 1)
             self.assertEqual(file_logs[0]["Failed attempts"].tolist(), [1, 2, 1])
@@ -196,7 +232,7 @@ class ValidationHistoryTests(unittest.TestCase):
                 with self.subTest(window=label):
                     app.selectbox[0].select(label).run(timeout=30)
                     self.assertFalse(app.exception)
-                    collect.assert_called_with(collection_window_hours=hours)
+                    collect.assert_called_with(collection_window_hours=hours, log_start=None, log_end=None)
                     self.assertIn(f"No collection runs recorded {period}.", [item.value for item in app.caption])
                     self.assertIn(
                         f"No collection failures or request retries recorded {period}.",
@@ -253,8 +289,21 @@ class ValidationHistoryTests(unittest.TestCase):
             self.assertFalse(app.exception)
             self.assertEqual(len(app.error), 0)
             self.assertFalse(any("Unfinished" in item.value.columns for item in app.dataframe))
+            app.radio[0].set_value("Daily").run(timeout=30)
+            self.assertFalse(app.exception)
+            self.assertIn("Daily polling coverage (full hours)", [item.value for item in app.subheader])
+            self.assertTrue(any("switch to Hourly" in item.value for item in app.info))
+            app.multiselect[0].select("Wilson").run(timeout=30)
+            self.assertFalse(app.exception)
+            self.assertTrue(any("1 selected station(s)" in item.value for item in app.caption))
+            app.selectbox[0].select("Custom range").run(timeout=30)
+            self.assertFalse(app.exception)
+            self.assertEqual(len(app.date_input), 1)
+            log_range = collect.call_args.kwargs
+            self.assertIsNone(log_range["collection_window_hours"])
+            self.assertEqual(log_range["log_end"] - log_range["log_start"], pd.Timedelta(days=8))
         self.assertFalse(app.exception)
-        self.assertEqual(app.selectbox[0].options, ["24 hours", "7 days", "30 days", "All history"])
+        self.assertEqual(app.selectbox[0].options, ["6 hours", "24 hours", "7 days", "30 days", "All history", "Custom range"])
         self.assertEqual([item.label for item in app.tabs], ["Overview", "Collection", "Forecast behavior", "Data quality"])
         self.assertIn("Collection logs", [item.value for item in app.subheader])
         self.assertGreaterEqual(len(app.get("vega_lite_chart")), 7)

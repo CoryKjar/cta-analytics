@@ -21,6 +21,7 @@ VALIDATION_HISTORY_QUERY = """
         FROM ingestion_files
         WHERE collection_timestamp AT TIME ZONE 'America/Chicago' >= %s
           AND collection_timestamp AT TIME ZONE 'America/Chicago' < %s
+          AND (%s::integer[] IS NULL OR station_id = ANY(%s::integer[]))
     ), prediction_counts AS (
         SELECT a.file_id, COUNT(*)::bigint AS prediction_rows,
                COUNT(*) FILTER (WHERE
@@ -102,6 +103,7 @@ ROUTE_QUALITY_QUERY = """
     FROM arrivals a JOIN routes r USING (route_id)
     WHERE a.collection_timestamp AT TIME ZONE 'America/Chicago' >= %s
       AND a.collection_timestamp AT TIME ZONE 'America/Chicago' < %s
+      AND (%s::integer[] IS NULL OR a.station_id = ANY(%s::integer[]))
     GROUP BY r.route_id,r.route_name ORDER BY predictions DESC
 """
 
@@ -115,6 +117,7 @@ STATION_COVERAGE_QUERY = """
     WHERE collection_timestamp AT TIME ZONE 'America/Chicago' >= %s
       AND collection_timestamp AT TIME ZONE 'America/Chicago' < %s
       AND station_id IS NOT NULL
+      AND (%s::integer[] IS NULL OR station_id = ANY(%s::integer[]))
     GROUP BY station_id
 """
 
@@ -175,11 +178,13 @@ def build_route_quality_frame(rows):
     return frame
 
 
-def build_station_coverage_frame(rows, window_start, as_of):
+def build_station_coverage_frame(rows, window_start, as_of, station_ids=None):
     found = {int(row[0]): row[1:] for row in rows}
     expected = max(0.0, (pd.Timestamp(as_of) - pd.Timestamp(window_start)).total_seconds() / 300)
     result = []
     for name, station_id in STATIONS.items():
+        if station_ids and station_id not in station_ids:
+            continue
         processed, unprocessed, empty, latest = found.get(station_id, (0, 0, 0, None))
         result.append({
             "Station": name.replace("_", " "), "Station ID": station_id,
@@ -192,31 +197,87 @@ def build_station_coverage_frame(rows, window_start, as_of):
     return frame.sort_values(["Coverage (%)", "Station"], na_position="first").reset_index(drop=True)
 
 
-def fetch_dashboard_history(window_hours=168):
-    """Return consistent, read-only hourly, route and station history for one window."""
-    if window_hours not in (24, 168, 720, None):
-        raise ValueError("Window must be 24, 168, 720 hours or None for all history.")
+def aggregate_daily(hourly):
+    """Sum hourly counts into Chicago calendar days and recompute rates from the sums."""
+    if hourly.empty:
+        return hourly
+    frame = hourly.copy()
+    frame["Day"] = frame["Hour"].str.slice(0, 10)
+    frame["full_hour_snapshots"] = frame["Snapshots"].where(frame["Nominal snapshots"].notna())
+    counts = [
+        "Snapshots", "Empty snapshots", "Unprocessed files", "Manifest mismatches",
+        "Predictions", "Invalid prediction rows", "delayed_rows", "not_delayed_rows",
+        "Unknown delay flags", "missing_gps_rows", "zero_gps_rows", "scheduled_rows",
+        "live_rows", "unknown_schedule_rows", "scheduled_missing_gps_rows",
+        "live_missing_gps_rows", "unclassified_missing_gps_rows",
+    ]
+    daily = frame.groupby("Day", sort=True).agg(
+        **{column: (column, "sum") for column in counts},
+        full_hour_snapshots=("full_hour_snapshots", "sum"),
+        **{"Nominal snapshots": ("Nominal snapshots", lambda values: values.sum(min_count=1))},
+        partial_hours=("Nominal snapshots", lambda values: values.isna().sum()),
+        hours=("Hour", "size"),
+    ).reset_index()
+    nan = float("nan")
+    # Days cut by the window edge would compare all snapshots against a partial nominal.
+    partial_day = (daily["partial_hours"] > 0) | (daily["hours"] < 23)
+    daily.loc[partial_day, "Nominal snapshots"] = nan
+    daily["Coverage (%)"] = 100 * daily["full_hour_snapshots"] / daily["Nominal snapshots"]
+    predictions = daily["Predictions"].replace(0, nan)
+    known_flags = (daily["delayed_rows"] + daily["not_delayed_rows"]).replace(0, nan)
+    daily["Reported delayed (%)"] = 100 * daily["delayed_rows"] / known_flags
+    daily["Unknown delay (%)"] = 100 * daily["Unknown delay flags"] / predictions
+    daily["Missing GPS (%)"] = 100 * daily["missing_gps_rows"] / predictions
+    daily["Zero GPS (%)"] = 100 * daily["zero_gps_rows"] / predictions
+    daily["Scheduled missing GPS (%)"] = 100 * daily["scheduled_missing_gps_rows"] / daily["scheduled_rows"].replace(0, nan)
+    daily["Live missing GPS (%)"] = 100 * daily["live_missing_gps_rows"] / daily["live_rows"].replace(0, nan)
+    daily["Unclassified missing GPS (%)"] = (
+        100 * daily["unclassified_missing_gps_rows"] / daily["unknown_schedule_rows"].replace(0, nan)
+    )
+    # Percentiles cannot be combined from hourly percentiles.
+    daily["Wait median (min)"] = nan
+    daily["Wait p90 (min)"] = nan
+    daily["Hour"] = daily["Day"]
+    return daily
+
+
+def fetch_dashboard_history(window_hours=168, *, start=None, end=None, station_ids=None):
+    """Return consistent, read-only hourly, route and station history for one window.
+
+    ``start``/``end`` (aware datetimes) override ``window_hours`` for a custom range.
+    """
+    if start is None and window_hours not in (6, 24, 168, 720, None):
+        raise ValueError("Window must be 6, 24, 168, 720 hours or None for all history.")
+    station_ids = sorted(station_ids) if station_ids else None
     with connect() as conn:
         conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
         conn.execute("SET LOCAL statement_timeout = '120s'")
         first_snapshot, as_of = conn.execute(
             "SELECT MIN(collection_timestamp AT TIME ZONE 'America/Chicago'),NOW() FROM ingestion_files"
         ).fetchone()
+        station_count = len(station_ids) if station_ids else len(STATIONS)
         if first_snapshot is None:
-            empty = build_validation_history_frame([], None, as_of, len(STATIONS))
+            empty = build_validation_history_frame([], None, as_of, station_count)
             return {"hourly": empty, "routes": build_route_quality_frame([]),
-                    "stations": build_station_coverage_frame([], as_of, as_of),
+                    "stations": build_station_coverage_frame([], as_of, as_of, station_ids),
                     "window_start": as_of, "as_of": as_of}
         earliest = pd.Timestamp(first_snapshot).tz_convert("UTC")
-        window_start = max(earliest, pd.Timestamp(as_of) - pd.Timedelta(hours=window_hours)) if window_hours else earliest
-        bounds = (window_start.to_pydatetime(), as_of)
+        if start is not None:
+            window_start = max(earliest, pd.Timestamp(start).tz_convert("UTC"))
+            if end is not None:
+                as_of = min(pd.Timestamp(as_of), pd.Timestamp(end).tz_convert("UTC")).to_pydatetime()
+        else:
+            window_start = max(earliest, pd.Timestamp(as_of) - pd.Timedelta(hours=window_hours)) if window_hours else earliest
+        if window_start >= pd.Timestamp(as_of):
+            window_start = pd.Timestamp(as_of)
+        bounds = (window_start.to_pydatetime(), as_of, station_ids, station_ids)
         hourly_rows = conn.execute(VALIDATION_HISTORY_QUERY, bounds).fetchall()
         route_rows = conn.execute(ROUTE_QUALITY_QUERY, bounds).fetchall()
         station_rows = conn.execute(STATION_COVERAGE_QUERY, bounds).fetchall()
     return {
-        "hourly": build_validation_history_frame(hourly_rows, window_start, as_of, len(STATIONS)),
+        "hourly": build_validation_history_frame(hourly_rows, window_start, as_of, station_count),
         "routes": build_route_quality_frame(route_rows),
-        "stations": build_station_coverage_frame(station_rows, window_start, as_of),
+        "stations": build_station_coverage_frame(station_rows, window_start, as_of, station_ids),
         "window_start": window_start,
         "as_of": as_of,
     }

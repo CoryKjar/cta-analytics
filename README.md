@@ -6,8 +6,8 @@ Personal portfolio project collecting CTA 'L' arrival predictions every five min
 
 ```text
 src/
-	pipeline.py               Collector entry point (Railway cron)
-	worker.py                 Optional persistent collector
+	pipeline.py               One-shot collection (manual or cron fallback)
+	worker.py                 Persistent collector (production)
 	config/                   Station list
 	ingestion/                CTA API requests and raw XML upload
 	transform/                XML parsing and source-conflict policy
@@ -47,11 +47,11 @@ Error fields store exception types and safe status codes, never messages, URLs o
 Run from the project root:
 
 ```powershell
-python -m src.pipeline                               # one collection (Railway cron */5)
+python -m src.worker                                 # persistent collector (Railway production)
+python -m src.pipeline                               # one collection (manual, or cron fallback)
 python -m src.storage.self_heal                      # recovery (Railway cron hourly)
 python -m src.monitoring.health_check                # health check and alerts (Railway cron */5)
 python -m src.monitoring.collection_gaps --hours 24  # read-only gap report
-python -m src.worker                                 # optional persistent collector
 python -m streamlit run dashboard/app.py             # read-only dashboard
 ```
 
@@ -80,7 +80,7 @@ Only archived or held XML is recoverable; processed files are never replayed. Th
 Safeguards:
 
 - A PostgreSQL advisory lock allows one collector at a time across cron, worker and manual runs. A run is also skipped if another run in the same interval is `running` or `completed`; failed or partial runs may retry. Skips log `event=collection_skipped` and exit 0. If the database is unavailable, collection proceeds without these checks.
-- `COLLECTION_DEADLINE_SECONDS` (default 240) stops starting new stations so a slow run cannot occupy the next cron tick. Unstarted stations are recorded `not_attempted` / `DeadlineExceeded`.
+- `COLLECTION_DEADLINE_SECONDS` (default 240) stops starting new stations so a slow run cannot occupy the next interval. Unstarted stations are recorded `not_attempted` / `DeadlineExceeded`.
 - Bucket uploads use 5 s connect / 15 s read timeouts and three standard-mode attempts.
 - Collector database connections (ledger, loader, held uploads) use `lock_timeout=30s` and `statement_timeout=120s`, so a stuck lock or query fails the run instead of blocking it.
 - If an upload fails after validation, the exact XML bytes (gzip) and SHA-256 are stored in `public.pending_uploads`. The station is recorded at stage `upload_deferred` and not loaded yet. Each recovery run first archives held rows, oldest first, to their original key and deletes a row only after the bucket copy's checksum matches. A different existing object is never overwritten (`ArchiveConflict`). The normal recovery inventory then loads the file. `PENDING_UPLOAD_MAX_ROWS` (default 40,000, about one day; October 26 XML averaged 2.9 KB, about 0.5 KB gzipped) caps the table. If the bucket and database are both unavailable, the response cannot be kept.
@@ -103,26 +103,26 @@ Recovery archives held uploads, then loads bucket XML that is missing from the m
 
 ## Deployment
 
-Collector-service variables on Railway:
+The `cta-analytics` collector service runs `python -m src.worker` with no cron schedule and restart policy `ON_FAILURE` (not `ALWAYS`, which would also restart after a clean deploy shutdown). Recovery and the monitor stay on cron. Collector-service variables:
 
 ```dotenv
 RAILWAY_DEPLOYMENT_OVERLAP_SECONDS=180
-RAILWAY_DEPLOYMENT_DRAINING_SECONDS=120
+RAILWAY_DEPLOYMENT_DRAINING_SECONDS=300
 ```
 
-On SIGTERM the collector records the request and lets the current collection, load and cleanup finish, then logs `pipeline_shutdown_completed` or `pipeline_shutdown_incomplete`. SIGKILL and host failures cannot be handled. Railway skips a cron execution while the previous one is still active.
+On SIGTERM the worker lets the current cycle's collection, load and cleanup finish, then stops; the one-shot pipeline does the same and logs `pipeline_shutdown_completed` or `pipeline_shutdown_incomplete`. SIGKILL and host failures cannot be handled. During deployment overlap, the advisory lock and interval check prevent double collection.
 
 Reconcile abandoned runs only after confirming the old process stopped. Preserve uploaded outcomes, mark the run partial and never fabricate snapshots or finish times.
 
-### Optional Persistent Worker
+### Persistent Worker
 
-`python -m src.worker` runs the same pipeline once per UTC interval. It waits on a monotonic clock and realigns to wall-clock boundaries, so run time does not cause drift. It starts immediately if launched within 120 s of an interval start, with no burst catch-up. Cycle failures are logged and the loop continues; SIGTERM/SIGINT finish the current cycle, then stop. A watchdog exits the process with code 1 (`event=worker_cycle_timeout`) if one cycle exceeds `WORKER_CYCLE_TIMEOUT_SECONDS` (default 600), because Railway restarts only processes that exit. On startup it logs persisted gaps from the last `WORKER_STARTUP_GAP_HOURS` (default 6). It stays resident, so memory is billed continuously; locally it used about 119 MB after imports.
+`python -m src.worker` runs the same pipeline once per UTC interval. It waits on a monotonic clock and realigns to wall-clock boundaries, so run time does not cause drift. It starts immediately if launched within 120 s of an interval start, with no burst catch-up. Cycle failures are logged and the loop continues. A watchdog exits the process with code 1 (`event=worker_cycle_timeout`) if one cycle exceeds `WORKER_CYCLE_TIMEOUT_SECONDS` (default 600), because Railway restarts only processes that exit. On startup it logs persisted gaps from the last `WORKER_STARTUP_GAP_HOURS` (default 6). It stays resident, so memory is billed continuously; locally it used about 119 MB after imports.
 
-To switch: remove the `cta-analytics` cron schedule, set the start command to `python -m src.worker` with restart policy `ON_FAILURE` (not `ALWAYS`, which would also restart after a clean deploy shutdown), and set `RAILWAY_DEPLOYMENT_DRAINING_SECONDS=300`. To roll back, restore `*/5 * * * *` and `python -m src.pipeline`. If both ever run, the lock and interval check make the second skip.
+To roll back to cron, set the `cta-analytics` schedule to `*/5 * * * *` and the start command to `python -m src.pipeline`. If both ever run, the lock and interval check make the second skip. Switching modes can miss the interval in which the change takes effect (the 2026-10-28 00:30 UTC switch missed one).
 
 ## Dashboard
 
-The dashboard shows 24-hour, 7-day, 30-day or full-history station coverage, prediction volume, consistency checks, forecast horizons, CTA delay flags and coordinate availability. It also shows file processing issues and collection run/attempt logs. Queries use one read-only consistent snapshot and are cached for five minutes. Coverage assumes 12 snapshots per station per full hour, counts valid empty responses, and excludes partial boundary hours. Unknown flags are not treated as false, and Chicago hour labels include the DST offset.
+The dashboard shows station coverage, prediction volume, consistency checks, forecast horizons, CTA delay flags and coordinate availability, plus file processing issues and collection run/attempt logs. The sidebar selects a 6-hour, 24-hour, 7-day, 30-day, full-history or custom Chicago date range. It also switches between hourly and daily granularity and filters by station and route. Station filters apply to coverage, prediction and route views; health issues and logs always cover all stations. Daily views sum hourly counts and recompute rates; days cut by the window edge have no coverage value, and wait percentiles are hourly only. Queries use one read-only consistent snapshot and are cached for five minutes. Coverage assumes 12 snapshots per station per full hour, counts valid empty responses, and excludes partial boundary hours. Unknown flags are not treated as false, and Chicago hour labels include the DST offset.
 
 ## Logging
 

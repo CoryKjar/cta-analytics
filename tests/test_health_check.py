@@ -88,8 +88,15 @@ class StationFreshnessTests(unittest.TestCase):
                              if "%s::integer IS NULL" in call.args[0]]
                 self.assertEqual(len(log_calls), 3)
                 for call in log_calls:
-                    self.assertEqual(call.args[1], (window_hours, window_hours))
+                    self.assertEqual(call.args[1], (window_hours, window_hours, None, None, None, None))
                     self.assertNotIn("INTERVAL '24 hours'", call.args[0])
+                    self.assertIn("%s::timestamptz IS NULL", call.args[0])
+                conn.execute.reset_mock()
+                start, end = now - timedelta(days=7), now - timedelta(days=5)
+                collect_health(collection_window_hours=None, log_start=start, log_end=end)
+                bounded = [call.args[1] for call in conn.execute.call_args_list
+                           if "%s::integer IS NULL" in call.args[0]]
+                self.assertEqual(bounded, [(None, None, start, start, end, end)] * 3)
                 self.assertTrue(any("OR attempts > 0" in call.args[0] for call in log_calls))
                 self.assertTrue(any("OR a.request_attempts > 1" in call.args[0] for call in log_calls))
                 run_queries = [call.args[0] for call in log_calls if "GROUP BY r.run_id" in call.args[0]]
