@@ -64,7 +64,7 @@ Keep `SELF_HEAL_ENABLED=false` on the collector because recovery runs as its own
 
 ## Collection Lifecycle
 
-For each configured station the collector requests CTA predictions (three attempts with bounded backoff), rejects API error responses, writes the XML locally and uploads it to `raw/YYYY/MM/DD/` in the bucket. Only after uploading does it parse and load predictions in one transaction, register valid empty responses as processed, and clean up staging. Every station's stage and outcome is recorded in `collection_runs` / `collection_attempts`.
+For each configured station the collector requests CTA predictions, rejecting API error responses. Transient 429/5xx responses and network timeouts use up to three attempts with bounded backoff; HTTP 409 gets one short retry. It writes the XML locally and uploads it to `raw/YYYY/MM/DD/` in the bucket. Only after uploading does it parse and load predictions in one transaction, register valid empty responses as processed, and clean up staging. Every station's stage and outcome is recorded in `collection_runs` / `collection_attempts`.
 
 The loader is idempotent: it uses the `arrivals` uniqueness constraint, recalculates manifest row counts, and requires the original XML for files with source conflicts or existing audits (`public.arrival_resolution_audit`). Do not replay audited historical files through the regular loader.
 

@@ -32,21 +32,28 @@ def fetch_cta_response(url, params, station_name, max_attempts=3, *, run_id=None
             on_attempt(attempt)
         try:
             response = requests.get(url, params=params, timeout=(5, 20))
-            if response.status_code in (429, 500, 502, 503, 504):
-                if attempt == max_attempts:
+            retryable_status = response.status_code in (429, 500, 502, 503, 504)
+            retry_limit = min(max_attempts, 2) if response.status_code == 409 else max_attempts
+            if retryable_status or (response.status_code == 409 and attempt < retry_limit):
+                if attempt >= retry_limit:
                     response.raise_for_status()
                 retry_after = response.headers.get("Retry-After")
                 try:
-                    delay = min(float(retry_after), 30) if retry_after else 0
+                    delay_cap = 5 if response.status_code == 409 else 30
+                    delay = min(float(retry_after), delay_cap) if retry_after else 0
                 except ValueError:
                     delay = 0
                 if delay <= 0:
-                    delay = min(2 ** (attempt - 1) + random.uniform(0, 1), 15)
+                    delay = (
+                        0.5 + random.uniform(0, 1)
+                        if response.status_code == 409
+                        else min(2 ** (attempt - 1) + random.uniform(0, 1), 15)
+                    )
                 if on_retry is not None:
                     on_retry(http_status=response.status_code, error_type="HTTPError")
                 logger.warning(
                     "event=cta_retry run_id=%s station=%s http_status=%s attempt=%s/%s delay_seconds=%.1f",
-                    run_id, station_name, response.status_code, attempt, max_attempts, delay,
+                    run_id, station_name, response.status_code, attempt, retry_limit, delay,
                 )
                 time.sleep(delay)
                 continue

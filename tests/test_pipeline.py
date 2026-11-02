@@ -177,6 +177,48 @@ class FetchResponseValidationTests(unittest.TestCase):
         self.assertIn("run_id=%s", logger.warning.call_args.args[0])
         sleep.assert_called_once_with(1.0)
 
+    @patch("src.ingestion.fetch_arrivals.time.sleep")
+    @patch("src.ingestion.fetch_arrivals.requests.get")
+    @patch("src.ingestion.fetch_arrivals.logger")
+    def test_conflict_retries_once_and_can_recover(self, logger, get, sleep):
+        conflict = MagicMock(status_code=409, headers={})
+        success = MagicMock(status_code=200)
+        get.side_effect = [conflict, success]
+        retry = MagicMock()
+        attempts = []
+
+        result = fetch_cta_response(
+            "https://example.invalid/arrivals", {"mapid": 40540}, "Wilson",
+            on_attempt=attempts.append, on_retry=retry,
+        )
+
+        self.assertIs(result, success)
+        self.assertEqual(get.call_count, 2)
+        self.assertEqual(attempts, [1, 2])
+        retry.assert_called_once_with(http_status=409, error_type="HTTPError")
+        delay = sleep.call_args.args[0]
+        self.assertGreaterEqual(delay, 0.5)
+        self.assertLessEqual(delay, 1.5)
+        self.assertIn("attempt=%s/%s", logger.warning.call_args.args[0])
+
+    @patch("src.ingestion.fetch_arrivals.time.sleep")
+    @patch("src.ingestion.fetch_arrivals.requests.get")
+    @patch("src.ingestion.fetch_arrivals.logger")
+    def test_persistent_conflict_stops_after_one_retry(self, logger, get, sleep):
+        from requests.exceptions import HTTPError
+
+        first = MagicMock(status_code=409, headers={})
+        second = MagicMock(status_code=409, headers={})
+        second.raise_for_status.side_effect = HTTPError(response=second)
+        get.side_effect = [first, second, MagicMock(status_code=200)]
+
+        with self.assertRaises(HTTPError):
+            fetch_cta_response("https://example.invalid/arrivals", {}, "Wilson")
+
+        self.assertEqual(get.call_count, 2)
+        sleep.assert_called_once()
+        second.raise_for_status.assert_called_once()
+
     @patch("src.ingestion.fetch_arrivals.CollectionAttemptLedger")
     @patch("src.ingestion.fetch_arrivals.logger")
     @patch("src.ingestion.fetch_arrivals.upload_file")
