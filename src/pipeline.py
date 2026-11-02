@@ -7,7 +7,7 @@ import pandas as pd
 import requests
 
 from src.ingestion.fetch_arrivals import fetch_arrivals
-from src.transform.parse_arrivals import parse_arrivals
+from src.transform.parse_arrivals import capture_timestamp_from_filename, parse_arrivals
 from src.storage.collection_ledger import CollectionSkipped
 from src.storage.load_arrivals_postgres import load_arrivals_data, register_file_results
 from src.utils.cleanup_staging import cleanup_staged_files
@@ -114,6 +114,7 @@ def _run_pipeline():
                 empty_files.append({
                     "source_file": path.name,
                     "collection_timestamp": _timestamp_from_path(path),
+                    "capture_timestamp": capture_timestamp_from_filename(path.name),
                     "station_id": None,
                     "status": "processed",
                     "row_count": 0,
@@ -127,6 +128,7 @@ def _run_pipeline():
             parse_failures.append({
                 "source_file": path.name,
                 "collection_timestamp": _timestamp_from_path(path),
+                "capture_timestamp": capture_timestamp_from_filename(path.name),
                 "station_id": None,
                 "status": "failed",
                 "row_count": 0,

@@ -8,8 +8,8 @@ import pandas as pd
 from src.config.stations import station_id_from_filename
 from src.storage.load_arrivals_postgres import load_arrivals_data, register_file_results
 from src.transform.parse_arrivals import (
-    parse_arrivals, parse_arrivals_xml, parse_cta_boolean, parse_cta_run_number,
-    source_prediction_records,
+    capture_timestamp_from_filename, parse_arrivals, parse_arrivals_xml,
+    parse_cta_boolean, parse_cta_run_number, source_prediction_records,
 )
 
 
@@ -189,10 +189,34 @@ class ArrivalLoaderTests(unittest.TestCase):
     def test_filename_station_lookup_is_exact(self):
         self.assertEqual(station_id_from_filename("20261016_162119_Wilson.xml"), 40540)
         self.assertEqual(
+            station_id_from_filename("20261101_010000_Wilson__c20261101T070000000000Z.xml"),
+            40540,
+        )
+        self.assertEqual(
             station_id_from_filename("20261016_162119_Western_Blue_Forest_Park.xml"), 40220,
         )
         self.assertIsNone(station_id_from_filename("20261016_162119_Unknown.xml"))
         self.assertIsNone(station_id_from_filename("Wilson.xml"))
+
+    def test_capture_timestamp_is_read_from_unique_filename_suffix(self):
+        self.assertEqual(
+            capture_timestamp_from_filename("20261101_010000_Wilson__c20261101T070000000000Z.xml"),
+            pd.Timestamp("2026-11-01T07:00:00Z").to_pydatetime(),
+        )
+        self.assertIsNone(capture_timestamp_from_filename("20261101_010000_Wilson.xml"))
+
+    def test_parser_preserves_capture_timestamp_separately_from_cta_time(self):
+        filename = "20261101_010000_Wilson__c20261101T070000000000Z.xml"
+        data = XML_SAMPLE.format(
+            approaching="0", delayed="1", latitude="41.9", longitude="-87.6",
+        ).replace("20261016 16:21:19", "20261101 01:00:00")
+        data = data.replace("20261016 16:21:00", "20261101 00:59:44")
+        frame = parse_arrivals_xml(data.encode(), filename)
+        self.assertEqual(frame.loc[0, "collection_timestamp"], pd.Timestamp("2026-11-01 01:00:00"))
+        self.assertEqual(
+            frame.loc[0, "capture_timestamp"],
+            pd.Timestamp("2026-11-01T07:00:00Z").to_pydatetime(),
+        )
 
     @patch("src.storage.load_arrivals_postgres._database_url", return_value="unused")
     @patch("src.storage.load_arrivals_postgres.psycopg.connect")
@@ -206,8 +230,8 @@ class ArrivalLoaderTests(unittest.TestCase):
         register_file_results(results)
 
         records = cursor.executemany.call_args.args[1]
-        self.assertEqual(records[0][2], 40540)
-        self.assertEqual(records[1][2], 123)
+        self.assertEqual(records[0][3], 40540)
+        self.assertEqual(records[1][3], 123)
         self.assertIsNone(results[0]["station_id"])
 
     @patch("src.storage.load_arrivals_postgres._database_url", return_value="unused")

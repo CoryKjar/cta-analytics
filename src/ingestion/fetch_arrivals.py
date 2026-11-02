@@ -117,6 +117,7 @@ def fetch_arrivals():
                     ),
                     on_retry=lambda **details: ledger.record_retry_failure(map_id, **details),
                 )
+                capture_timestamp = datetime.now(timezone.utc)
                 http_status = response.status_code
                 stage = "response_parse"
                 ledger.set_stage(map_id, stage, http_status=http_status)
@@ -143,7 +144,9 @@ def fetch_arrivals():
                 if timestamp_node is None or not timestamp_node.text:
                     raise ValueError("CTA response has no valid tmst timestamp.")
                 timestamp = datetime.strptime(timestamp_node.text, "%Y%m%d %H:%M:%S").strftime("%Y%m%d_%H%M%S")
-                local_path = output_folder / f"{timestamp}_{station_name}.xml"
+                capture_token = capture_timestamp.strftime("%Y%m%dT%H%M%S%fZ")
+                source_file = f"{timestamp}_{station_name}__c{capture_token}.xml"
+                local_path = output_folder / source_file
                 object_key = f"raw/{timestamp[:4]}/{timestamp[4:6]}/{timestamp[6:8]}/{local_path.name}"
                 stage = "local_write"
                 ledger.set_stage(

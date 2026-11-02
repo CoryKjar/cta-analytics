@@ -364,7 +364,7 @@ with quality_tab:
         with invalid_column:
             st.markdown("**Invalid prediction rows**")
             st.caption("Missing required values, malformed run identity, wait arithmetic/timing violations, or out-of-range source values.")
-            line_chart(hourly, "Invalid prediction rows", height=280)
+            line_chart(hourly, ["Invalid prediction rows", "Ambiguous timing rows"], height=280)
         with manifest_column:
             st.markdown("**Manifest reconciliation**")
             st.caption("Processed-file row counts that do not match stored arrivals, plus files not yet processed.")

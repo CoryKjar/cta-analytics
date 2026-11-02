@@ -151,5 +151,8 @@ STATIONS = {
 
 def station_id_from_filename(source_file):
     """Resolve exact configured station names, including names with underscores."""
-    match = re.fullmatch(r"[0-9]{8}_[0-9]{6}_(.+)[.]xml", Path(source_file).name)
+    match = re.fullmatch(
+        r"[0-9]{8}_[0-9]{6}_(.+?)(?:__c[0-9]{8}T[0-9]{12}Z)?[.]xml",
+        Path(source_file).name,
+    )
     return STATIONS.get(match.group(1)) if match else None

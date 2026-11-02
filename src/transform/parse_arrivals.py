@@ -1,7 +1,7 @@
 import xml.etree.ElementTree as ET
 import gzip
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 import pandas as pd
 from pathlib import Path
 
@@ -21,6 +21,13 @@ def parse_cta_boolean(value):
 
 def parse_arrivals(xml_file):
     return parse_arrivals_xml(Path(xml_file).read_bytes(), Path(xml_file).name)
+
+
+def capture_timestamp_from_filename(source_file):
+    match = re.search(r"__c([0-9]{8}T[0-9]{12}Z)$", Path(source_file).stem)
+    if not match:
+        return None
+    return datetime.strptime(match.group(1), "%Y%m%dT%H%M%S%fZ").replace(tzinfo=timezone.utc)
 
 
 def parse_cta_run_number(value):
@@ -49,6 +56,7 @@ def parse_arrivals_xml(xml_bytes, source_file):
     parts = filename.split("_")
 
     collection_timestamp = pd.to_datetime("_".join(parts[:2]),format="%Y%m%d_%H%M%S")
+    capture_timestamp = capture_timestamp_from_filename(source_file)
 
     for eta in etas:
         station_id = eta.find("staId").text
@@ -101,11 +109,15 @@ def parse_arrivals_xml(xml_bytes, source_file):
             "heading": heading,
             "wait_time": wait_time,
             "source_file": Path(source_file).name,
+            "capture_timestamp": capture_timestamp,
             "_source_xml_gzip": source_xml,
         })
 
 
-    return pd.DataFrame(records)
+    frame = pd.DataFrame(records)
+    if "capture_timestamp" not in frame:
+        frame["capture_timestamp"] = pd.Series(dtype="datetime64[ns, UTC]")
+    return frame
 
 
 def source_prediction_records(xml_bytes, file_record, routes, destinations):

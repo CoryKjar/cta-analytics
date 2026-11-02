@@ -214,10 +214,10 @@ class FetchResponseValidationTests(unittest.TestCase):
                     patch("src.ingestion.fetch_arrivals.STATIONS", {"Wilson": 40540}), \
                     patch("src.ingestion.fetch_arrivals.Path", return_value=Path(directory)):
                 uploaded = fetch_arrivals()
-            expected = Path(directory) / "20261016_162119_Wilson.xml"
-            self.assertEqual(uploaded, [expected])
-            self.assertTrue(parse_arrivals(expected).empty)
-            upload.assert_called_once_with(expected, "raw/2026/10/16/20261016_162119_Wilson.xml")
+                expected = uploaded[0]
+                self.assertRegex(expected.name, r"^20261016_162119_Wilson__c[0-9]{8}T[0-9]{12}Z[.]xml$")
+                self.assertTrue(parse_arrivals(expected).empty)
+                upload.assert_called_once_with(expected, f"raw/2026/10/16/{expected.name}")
             ledger_class.return_value.station_uploaded.assert_called_once()
             ledger_class.return_value.finish.assert_called_once_with(
                 uploaded_count=1, failed_count=0, fatal_error_type=None,
@@ -244,8 +244,8 @@ class FetchResponseValidationTests(unittest.TestCase):
         failure = ledger_class.return_value.station_failed.call_args.kwargs
         self.assertEqual(failure["stage"], "bucket_upload")
         self.assertEqual(failure["http_status"], 200)
-        self.assertEqual(failure["source_file"], "20261016_162119_Wilson.xml")
-        self.assertEqual(failure["object_key"], "raw/2026/10/16/20261016_162119_Wilson.xml")
+        self.assertRegex(failure["source_file"], r"^20261016_162119_Wilson__c[0-9]{8}T[0-9]{12}Z[.]xml$")
+        self.assertEqual(failure["object_key"], f"raw/2026/10/16/{failure['source_file']}")
         self.assertNotIn("private storage detail", str(logger.error.call_args_list))
 
     @patch("src.ingestion.fetch_arrivals.PendingUploadStore")
@@ -266,7 +266,8 @@ class FetchResponseValidationTests(unittest.TestCase):
                     patch("src.ingestion.fetch_arrivals.Path", return_value=Path(directory)):
                 self.assertEqual(fetch_arrivals(), [])
             self.assertEqual(list(Path(directory).iterdir()), [])
-        self.assertEqual(held, [(fetch.return_value.text.encode(), "raw/2026/10/16/20261016_162119_Wilson.xml")])
+        self.assertEqual(held[0][0], fetch.return_value.text.encode())
+        self.assertRegex(held[0][1], r"^raw/2026/10/16/20261016_162119_Wilson__c[0-9]{8}T[0-9]{12}Z[.]xml$")
         self.assertEqual(ledger_class.return_value.station_failed.call_args.kwargs["stage"], "upload_deferred")
         store.close.assert_called_once()
 

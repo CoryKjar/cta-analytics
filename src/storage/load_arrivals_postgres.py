@@ -42,6 +42,7 @@ def register_file_results(results):
         (
             item["source_file"],
             item["collection_timestamp"],
+            item.get("capture_timestamp"),
             item["station_id"] if item.get("station_id") is not None
             else station_id_from_filename(item["source_file"]),
             item["status"],
@@ -58,18 +59,21 @@ def register_file_results(results):
             cursor.executemany(
                 """
                 INSERT INTO ingestion_files (
-                    source_file, collection_timestamp, station_id, status,
+                    source_file, collection_timestamp, capture_timestamp, station_id, status,
                     row_count, attempts, last_error, created_at, updated_at,
                     processed_at
                 )
                 VALUES (
-                    %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s, %s,
                     CASE WHEN %s = 'failed' THEN 1 ELSE 0 END,
                     %s, NOW(), NOW(),
                     CASE WHEN %s = 'processed' THEN NOW() ELSE NULL END
                 )
                 ON CONFLICT (source_file) DO UPDATE SET
                     collection_timestamp = EXCLUDED.collection_timestamp,
+                    capture_timestamp = COALESCE(
+                        EXCLUDED.capture_timestamp, ingestion_files.capture_timestamp
+                    ),
                     station_id = COALESCE(
                         EXCLUDED.station_id, ingestion_files.station_id
                     ),
@@ -142,6 +146,8 @@ def load_arrivals_data(df):
         raise ValueError(f"Arrival DataFrame missing columns: {sorted(missing)}")
 
     df = df.copy()
+    if "capture_timestamp" not in df:
+        df["capture_timestamp"] = None
     for column in ("is_approaching", "is_delayed", "is_scheduled", "is_fault"):
         df[column] = df[column].map(parse_cta_boolean)
     df["run_number"] = df["run_number"].map(parse_cta_run_number)
@@ -176,12 +182,14 @@ def load_arrivals_data(df):
                 destination_map = {name: dest_id for dest_id, name in cursor.fetchall()}
 
             source_files = df[
-                ["source_file", "collection_timestamp", "station_id"]
+                ["source_file", "collection_timestamp", "capture_timestamp", "station_id"]
             ].drop_duplicates(subset=["source_file"])
             file_records = [
                 (
                     str(row["source_file"]),
                     pd.Timestamp(row["collection_timestamp"]).to_pydatetime(),
+                    pd.Timestamp(row["capture_timestamp"]).to_pydatetime()
+                    if pd.notna(row["capture_timestamp"]) else None,
                     int(row["station_id"]),
                 )
                 for _, row in source_files.iterrows()
@@ -190,12 +198,15 @@ def load_arrivals_data(df):
             cursor.executemany(
                 """
                 INSERT INTO ingestion_files (
-                    source_file, collection_timestamp, station_id,
+                    source_file, collection_timestamp, capture_timestamp, station_id,
                     status, row_count, attempts, created_at, updated_at
                 )
-                VALUES (%s, %s, %s, 'processing', 0, 0, NOW(), NOW())
+                VALUES (%s, %s, %s, %s, 'processing', 0, 0, NOW(), NOW())
                 ON CONFLICT (source_file) DO UPDATE SET
                     collection_timestamp = EXCLUDED.collection_timestamp,
+                    capture_timestamp = COALESCE(
+                        EXCLUDED.capture_timestamp, ingestion_files.capture_timestamp
+                    ),
                     station_id = EXCLUDED.station_id,
                     status = 'processing',
                     last_error = NULL,
@@ -285,7 +296,7 @@ def load_arrivals_data(df):
                 )
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (
-                    collection_timestamp, stop_id, route_id, arrival_time, run_number
+                    file_id, stop_id, route_id, arrival_time, run_number
                 ) DO UPDATE SET
                     is_approaching = EXCLUDED.is_approaching,
                     is_delayed = EXCLUDED.is_delayed,

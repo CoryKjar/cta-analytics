@@ -7,7 +7,7 @@ from src.config.stations import STATIONS
 
 VALIDATION_COLUMNS = (
     "hour_utc", "snapshot_files", "empty_files", "unprocessed_files",
-    "manifest_mismatches", "prediction_rows", "invalid_rows", "delayed_rows",
+    "manifest_mismatches", "prediction_rows", "invalid_rows", "ambiguous_timing_rows", "delayed_rows",
     "not_delayed_rows", "unknown_delay_rows", "missing_gps_rows", "zero_gps_rows",
     "scheduled_rows", "live_rows", "unknown_schedule_rows",
     "scheduled_missing_gps_rows", "live_missing_gps_rows",
@@ -17,11 +17,24 @@ VALIDATION_COLUMNS = (
 
 VALIDATION_HISTORY_QUERY = """
     WITH scoped_files AS (
-        SELECT file_id, collection_timestamp, station_id, status, row_count
+        SELECT file_id, collection_timestamp, capture_timestamp,
+               COALESCE(capture_timestamp, collection_timestamp AT TIME ZONE 'America/Chicago') AS captured_at,
+               station_id, status, row_count
         FROM ingestion_files
-        WHERE collection_timestamp AT TIME ZONE 'America/Chicago' >= %s
-          AND collection_timestamp AT TIME ZONE 'America/Chicago' < %s
+        WHERE COALESCE(capture_timestamp, collection_timestamp AT TIME ZONE 'America/Chicago') >= %s
+          AND COALESCE(capture_timestamp, collection_timestamp AT TIME ZONE 'America/Chicago') < %s
           AND (%s::integer[] IS NULL OR station_id = ANY(%s::integer[]))
+    ), prediction_candidates AS (
+        SELECT a.*, f.capture_timestamp AS file_capture_timestamp, f.captured_at,
+               a.prediction_time AT TIME ZONE 'America/Chicago' AS prediction_at_standard,
+               (a.prediction_time AT TIME ZONE 'America/Chicago') - INTERVAL '1 hour' AS prediction_at_daylight,
+               ((a.prediction_time AT TIME ZONE 'America/Chicago')
+                   - ((a.prediction_time - INTERVAL '1 hour') AT TIME ZONE 'America/Chicago')
+                   = INTERVAL '2 hours') AS prediction_is_ambiguous,
+               ((a.collection_timestamp AT TIME ZONE 'America/Chicago')
+                   - ((a.collection_timestamp - INTERVAL '1 hour') AT TIME ZONE 'America/Chicago')
+                   = INTERVAL '2 hours') AS collection_is_ambiguous
+        FROM arrivals a JOIN scoped_files f USING (file_id)
     ), prediction_counts AS (
         SELECT a.file_id, COUNT(*)::bigint AS prediction_rows,
                COUNT(*) FILTER (WHERE
@@ -31,12 +44,24 @@ VALIDATION_HISTORY_QUERY = """
                    OR a.prediction_time IS NULL OR a.arrival_time IS NULL
                    OR a.direction IS NULL OR a.direction NOT IN ('1', '5')
                    OR a.wait_time IS NULL OR a.wait_time < 0
-                   OR a.prediction_time > a.collection_timestamp
+                   OR CASE
+                       WHEN a.file_capture_timestamp IS NULL THEN
+                           a.prediction_time > a.collection_timestamp
+                           AND NOT (a.prediction_is_ambiguous AND a.collection_is_ambiguous)
+                       WHEN a.prediction_is_ambiguous THEN
+                           a.prediction_at_standard > a.captured_at
+                           AND a.prediction_at_daylight > a.captured_at
+                       ELSE a.prediction_at_standard > a.captured_at
+                   END
                    OR ABS(a.wait_time - EXTRACT(EPOCH FROM (a.arrival_time - a.prediction_time)) / 60) > 0.0001
                    OR a.latitude NOT BETWEEN -90 AND 90
                    OR a.longitude NOT BETWEEN -180 AND 180
                    OR a.heading NOT BETWEEN 0 AND 360
                )::bigint AS invalid_rows,
+               COUNT(*) FILTER (WHERE a.file_capture_timestamp IS NULL
+                   AND a.prediction_time > a.collection_timestamp
+                   AND a.prediction_is_ambiguous AND a.collection_is_ambiguous)::bigint
+                   AS ambiguous_timing_rows,
                COUNT(*) FILTER (WHERE a.is_delayed IS TRUE)::bigint AS delayed_rows,
                COUNT(*) FILTER (WHERE a.is_delayed IS FALSE)::bigint AS not_delayed_rows,
                COUNT(*) FILTER (WHERE a.is_delayed IS NULL)::bigint AS unknown_delay_rows,
@@ -51,16 +76,16 @@ VALIDATION_HISTORY_QUERY = """
                    AND (a.latitude IS NULL OR a.longitude IS NULL))::bigint AS live_missing_gps_rows,
                COUNT(*) FILTER (WHERE a.is_scheduled IS NULL
                    AND (a.latitude IS NULL OR a.longitude IS NULL))::bigint AS unclassified_missing_gps_rows
-        FROM arrivals a JOIN scoped_files f USING (file_id) GROUP BY a.file_id
+        FROM prediction_candidates a GROUP BY a.file_id
     ), hourly_forecast AS (
-        SELECT date_trunc('hour', a.collection_timestamp AT TIME ZONE 'America/Chicago', 'UTC') AS hour_utc,
+        SELECT date_trunc('hour', f.captured_at, 'UTC') AS hour_utc,
                percentile_cont(0.5) WITHIN GROUP (ORDER BY a.wait_time) AS median_wait,
                percentile_cont(0.9) WITHIN GROUP (ORDER BY a.wait_time) AS p90_wait
         FROM arrivals a JOIN scoped_files f USING (file_id)
         WHERE a.wait_time IS NOT NULL
         GROUP BY 1
     ), hourly_files AS (
-        SELECT date_trunc('hour', f.collection_timestamp AT TIME ZONE 'America/Chicago', 'UTC') AS hour_utc,
+        SELECT date_trunc('hour', f.captured_at, 'UTC') AS hour_utc,
                COUNT(*)::bigint AS snapshot_files,
                COUNT(*) FILTER (WHERE f.status = 'processed' AND f.row_count = 0)::bigint AS empty_files,
                COUNT(*) FILTER (WHERE f.status <> 'processed')::bigint AS unprocessed_files,
@@ -68,6 +93,7 @@ VALIDATION_HISTORY_QUERY = """
                    AND f.row_count IS DISTINCT FROM COALESCE(p.prediction_rows, 0))::bigint AS manifest_mismatches,
                COALESCE(SUM(p.prediction_rows), 0)::bigint AS prediction_rows,
                COALESCE(SUM(p.invalid_rows), 0)::bigint AS invalid_rows,
+               COALESCE(SUM(p.ambiguous_timing_rows), 0)::bigint AS ambiguous_timing_rows,
                COALESCE(SUM(p.delayed_rows), 0)::bigint AS delayed_rows,
                COALESCE(SUM(p.not_delayed_rows), 0)::bigint AS not_delayed_rows,
                COALESCE(SUM(p.unknown_delay_rows), 0)::bigint AS unknown_delay_rows,
@@ -83,7 +109,7 @@ VALIDATION_HISTORY_QUERY = """
         GROUP BY 1
     )
     SELECT h.hour_utc,h.snapshot_files,h.empty_files,h.unprocessed_files,
-           h.manifest_mismatches,h.prediction_rows,h.invalid_rows,h.delayed_rows,
+           h.manifest_mismatches,h.prediction_rows,h.invalid_rows,h.ambiguous_timing_rows,h.delayed_rows,
            h.not_delayed_rows,h.unknown_delay_rows,h.missing_gps_rows,h.zero_gps_rows,
            h.scheduled_rows,h.live_rows,h.unknown_schedule_rows,
            h.scheduled_missing_gps_rows,h.live_missing_gps_rows,
@@ -100,9 +126,9 @@ ROUTE_QUALITY_QUERY = """
            COUNT(*) FILTER (WHERE a.is_delayed IS TRUE)::bigint AS delayed_rows,
            COUNT(*) FILTER (WHERE a.is_delayed IS FALSE)::bigint AS not_delayed_rows,
            COUNT(*) FILTER (WHERE a.is_delayed IS NULL)::bigint AS unknown_delay_rows
-    FROM arrivals a JOIN routes r USING (route_id)
-    WHERE a.collection_timestamp AT TIME ZONE 'America/Chicago' >= %s
-      AND a.collection_timestamp AT TIME ZONE 'America/Chicago' < %s
+        FROM arrivals a JOIN ingestion_files f USING (file_id) JOIN routes r USING (route_id)
+        WHERE COALESCE(f.capture_timestamp, f.collection_timestamp AT TIME ZONE 'America/Chicago') >= %s
+            AND COALESCE(f.capture_timestamp, f.collection_timestamp AT TIME ZONE 'America/Chicago') < %s
       AND (%s::integer[] IS NULL OR a.station_id = ANY(%s::integer[]))
     GROUP BY r.route_id,r.route_name ORDER BY predictions DESC
 """
@@ -114,8 +140,8 @@ STATION_COVERAGE_QUERY = """
            COUNT(*) FILTER (WHERE status = 'processed' AND row_count = 0)::bigint AS empty_files,
            MAX(collection_timestamp) AS latest_snapshot
     FROM ingestion_files
-    WHERE collection_timestamp AT TIME ZONE 'America/Chicago' >= %s
-      AND collection_timestamp AT TIME ZONE 'America/Chicago' < %s
+        WHERE COALESCE(capture_timestamp, collection_timestamp AT TIME ZONE 'America/Chicago') >= %s
+            AND COALESCE(capture_timestamp, collection_timestamp AT TIME ZONE 'America/Chicago') < %s
       AND station_id IS NOT NULL
       AND (%s::integer[] IS NULL OR station_id = ANY(%s::integer[]))
     GROUP BY station_id
@@ -160,6 +186,7 @@ def build_validation_history_frame(rows, window_start, as_of, station_count):
     return frame.rename(columns={
         "snapshot_files": "Snapshots", "empty_files": "Empty snapshots",
         "prediction_rows": "Predictions", "invalid_rows": "Invalid prediction rows",
+        "ambiguous_timing_rows": "Ambiguous timing rows",
         "unprocessed_files": "Unprocessed files", "manifest_mismatches": "Manifest mismatches",
         "unknown_delay_rows": "Unknown delay flags",
     }).reset_index(drop=True)
@@ -206,7 +233,7 @@ def aggregate_daily(hourly):
     frame["full_hour_snapshots"] = frame["Snapshots"].where(frame["Nominal snapshots"].notna())
     counts = [
         "Snapshots", "Empty snapshots", "Unprocessed files", "Manifest mismatches",
-        "Predictions", "Invalid prediction rows", "delayed_rows", "not_delayed_rows",
+        "Predictions", "Invalid prediction rows", "Ambiguous timing rows", "delayed_rows", "not_delayed_rows",
         "Unknown delay flags", "missing_gps_rows", "zero_gps_rows", "scheduled_rows",
         "live_rows", "unknown_schedule_rows", "scheduled_missing_gps_rows",
         "live_missing_gps_rows", "unclassified_missing_gps_rows",

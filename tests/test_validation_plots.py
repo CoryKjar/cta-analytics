@@ -5,7 +5,8 @@ from unittest.mock import patch
 import pandas as pd
 
 from dashboard.manifest_history import (
-    VALIDATION_COLUMNS, build_route_quality_frame, build_station_coverage_frame,
+    ROUTE_QUALITY_QUERY, STATION_COVERAGE_QUERY, VALIDATION_COLUMNS,
+    VALIDATION_HISTORY_QUERY, build_route_quality_frame, build_station_coverage_frame,
     build_validation_history_frame, fetch_dashboard_history,
 )
 from src.config.stations import STATIONS
@@ -66,6 +67,23 @@ class ValidationHistoryTests(unittest.TestCase):
         self.assertTrue(frame.loc[0, "Hour"].endswith("01:00 CDT"))
         self.assertTrue(frame.loc[1, "Hour"].endswith("01:00 CST"))
 
+    def test_legacy_fall_back_timing_is_reported_as_ambiguous_not_invalid(self):
+        rows = [history_row(
+            "2026-11-01T07:00Z", invalid_rows=0, ambiguous_timing_rows=92,
+        )]
+        frame = build_validation_history_frame(
+            rows, "2026-11-01T07:00Z", "2026-11-01T08:00Z", 143,
+        )
+        self.assertEqual(frame.loc[0, "Invalid prediction rows"], 0)
+        self.assertEqual(frame.loc[0, "Ambiguous timing rows"], 92)
+
+    def test_history_queries_use_capture_instants_for_dst_bins(self):
+        self.assertIn("COALESCE(capture_timestamp", VALIDATION_HISTORY_QUERY)
+        self.assertIn("date_trunc('hour', f.captured_at, 'UTC')", VALIDATION_HISTORY_QUERY)
+        self.assertIn("prediction_is_ambiguous", VALIDATION_HISTORY_QUERY)
+        self.assertIn("COALESCE(f.capture_timestamp", ROUTE_QUALITY_QUERY)
+        self.assertIn("COALESCE(capture_timestamp", STATION_COVERAGE_QUERY)
+
     def test_station_coverage_includes_configured_stations_with_no_files(self):
         first_id = next(iter(STATIONS.values()))
         frame = build_station_coverage_frame(
@@ -99,6 +117,22 @@ class ValidationHistoryTests(unittest.TestCase):
         self.assertAlmostEqual(first["Coverage (%)"], 100 * 18 / (12 * 24))
         self.assertTrue(pd.isna(daily.iloc[-1]["Coverage (%)"]))
         self.assertTrue(daily["Wait median (min)"].isna().all())
+
+    def test_daily_coverage_expects_25_hours_on_fall_back_day(self):
+        from dashboard.manifest_history import aggregate_daily
+
+        rows = [
+            history_row(hour, snapshot_files=143 * 12)
+            for hour in pd.date_range("2026-11-01T05:00Z", periods=25, freq="h")
+        ]
+        hourly = build_validation_history_frame(
+            rows, "2026-11-01T05:00Z", "2026-11-02T06:00Z", 143,
+        )
+        daily = aggregate_daily(hourly)
+        self.assertEqual(len(daily), 1)
+        self.assertEqual(daily.loc[0, "Nominal snapshots"], 143 * 12 * 25)
+        self.assertEqual(daily.loc[0, "Snapshots"], 143 * 12 * 25)
+        self.assertEqual(daily.loc[0, "Coverage (%)"], 100)
 
     @patch("dashboard.manifest_history.connect")
     def test_custom_range_and_station_filter_bound_every_query(self, connect):

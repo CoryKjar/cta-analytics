@@ -52,7 +52,7 @@ from dotenv import load_dotenv
 
 from src.storage.load_arrivals_postgres import load_arrivals_data, register_file_results
 
-from src.transform.parse_arrivals import parse_arrivals
+from src.transform.parse_arrivals import capture_timestamp_from_filename, parse_arrivals
 
 from src.utils.cleanup_staging import cleanup_staged_files
 from src.utils.logger import get_logger
@@ -386,6 +386,8 @@ def _run_self_heal():
 
                         "source_file": name, "collection_timestamp": _timestamp(name),
 
+                        "capture_timestamp": capture_timestamp_from_filename(name),
+
                         "station_id": None, "status": "processed", "row_count": 0,
 
                         "last_error": None,
@@ -438,6 +440,7 @@ def _run_self_heal():
                         failure_records.append({
                             "source_file": name,
                             "collection_timestamp": _timestamp(name),
+                            "capture_timestamp": capture_timestamp_from_filename(name),
                             "station_id": None,
                             "status": "failed",
                             "row_count": 0,
@@ -476,6 +479,7 @@ def _run_self_heal():
                         failure_records.append({
                             "source_file": name,
                             "collection_timestamp": _timestamp(name),
+                            "capture_timestamp": capture_timestamp_from_filename(name),
                             "station_id": None,
                             "status": "failed",
                             "row_count": 0,
@@ -503,6 +507,7 @@ def _run_self_heal():
                 failure_records.append({
                     "source_file": name,
                     "collection_timestamp": ts,
+                    "capture_timestamp": capture_timestamp_from_filename(name),
                     "station_id": None,
                     "status": "failed",
                     "row_count": 0,

@@ -39,6 +39,11 @@ The project runs against the existing production schema and does not bootstrap a
 1. [`20261020_add_collection_attempt_ledger.sql`](migrations/20261020_add_collection_attempt_ledger.sql): one run row and one row per station per collection (about 41,000 rows/day; plan retention). Ledger writes are best-effort and never block collection.
 2. [`20261020_add_collection_retry_context.sql`](migrations/20261020_add_collection_retry_context.sql): keeps the last retry's HTTP status and error type. Until applied, the collector logs `collection_retry_context_unavailable reason=migration_required` and the dashboard marks retry context unavailable.
 3. [`20261027_add_pending_uploads.sql`](migrations/20261027_add_pending_uploads.sql): holds validated XML when a bucket upload fails. Until applied, those responses are discarded and logged as `event=pending_upload_unavailable`.
+4. [`20261102_add_snapshot_capture_timestamp.sql`](migrations/20261102_add_snapshot_capture_timestamp.sql): adds the UTC fetch instant to `ingestion_files`; legacy rows remain NULL because their repeated-hour fold cannot be inferred safely.
+5. [`20261102_add_arrivals_snapshot_identity_index.sql`](migrations/20261102_add_arrivals_snapshot_identity_index.sql): builds the per-file arrivals key concurrently. Run this migration with autocommit enabled; `CREATE INDEX CONCURRENTLY` cannot run inside a transaction.
+6. [`20261102_drop_legacy_arrivals_identity.sql`](migrations/20261102_drop_legacy_arrivals_identity.sql): removes the old timestamp-based unique constraint after the updated collector is deployed and verified.
+
+For the DST-safe collector release, apply migrations 4 and 5 first, deploy and verify the updated collector, then apply migration 6. The old collector still needs its timestamp-based constraint until it is replaced.
 
 Error fields store exception types and safe status codes, never messages, URLs or credentials.
 
