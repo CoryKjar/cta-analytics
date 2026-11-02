@@ -67,6 +67,44 @@ class ValidationHistoryTests(unittest.TestCase):
         self.assertTrue(frame.loc[0, "Hour"].endswith("01:00 CDT"))
         self.assertTrue(frame.loc[1, "Hour"].endswith("01:00 CST"))
 
+    def test_legacy_fall_back_snapshots_merge_with_two_hour_nominal(self):
+        from dashboard.manifest_history import aggregate_daily
+
+        rows = [
+            history_row("2026-11-01T06:00Z", snapshot_files=0),
+            history_row("2026-11-01T07:00Z", snapshot_files=2981, legacy_fold_snapshots=2981),
+        ]
+        hourly = build_validation_history_frame(
+            rows, "2026-11-01T05:00Z", "2026-11-02T06:00Z", 143,
+        )
+        merged = hourly[hourly["Hour"].str.contains("CDT/CST")]
+        self.assertEqual(len(merged), 1)
+        self.assertIn("legacy combined", merged.iloc[0]["Hour"])
+        self.assertEqual(merged.iloc[0]["Snapshots"], 2981)
+        self.assertEqual(merged.iloc[0]["Nominal snapshots"], 143 * 24)
+        self.assertEqual(len(hourly), 24)
+
+        daily = aggregate_daily(hourly)
+        self.assertEqual(daily.loc[0, "Snapshots"], 2981)
+        self.assertEqual(daily.loc[0, "Nominal snapshots"], 143 * 12 * 25)
+
+    def test_multiple_legacy_folds_merge_in_all_history_order(self):
+        rows = [
+            history_row("2025-11-02T06:00Z", snapshot_files=0),
+            history_row("2025-11-02T07:00Z", snapshot_files=10, legacy_fold_snapshots=10),
+            history_row("2026-11-01T06:00Z", snapshot_files=0),
+            history_row("2026-11-01T07:00Z", snapshot_files=20, legacy_fold_snapshots=20),
+        ]
+        frame = build_validation_history_frame(
+            rows, "2025-11-02T05:00Z", "2026-11-02T06:00Z", 143,
+        )
+        merged = frame[frame["Hour"].str.contains("CDT/CST")]
+        self.assertEqual(merged["Hour"].tolist(), [
+            "2025-11-02 01:00 CDT/CST (legacy combined)",
+            "2026-11-01 01:00 CDT/CST (legacy combined)",
+        ])
+        self.assertEqual(merged["Snapshots"].tolist(), [10, 20])
+
     def test_legacy_fall_back_timing_is_reported_as_ambiguous_not_invalid(self):
         rows = [history_row(
             "2026-11-01T07:00Z", invalid_rows=0, ambiguous_timing_rows=92,

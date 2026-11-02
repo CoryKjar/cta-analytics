@@ -6,7 +6,7 @@ from src.config.stations import STATIONS
 
 
 VALIDATION_COLUMNS = (
-    "hour_utc", "snapshot_files", "empty_files", "unprocessed_files",
+    "hour_utc", "snapshot_files", "legacy_fold_snapshots", "empty_files", "unprocessed_files",
     "manifest_mismatches", "prediction_rows", "invalid_rows", "ambiguous_timing_rows", "delayed_rows",
     "not_delayed_rows", "unknown_delay_rows", "missing_gps_rows", "zero_gps_rows",
     "scheduled_rows", "live_rows", "unknown_schedule_rows",
@@ -87,6 +87,10 @@ VALIDATION_HISTORY_QUERY = """
     ), hourly_files AS (
         SELECT date_trunc('hour', f.captured_at, 'UTC') AS hour_utc,
                COUNT(*)::bigint AS snapshot_files,
+               COUNT(*) FILTER (WHERE f.capture_timestamp IS NULL
+                   AND ((f.collection_timestamp AT TIME ZONE 'America/Chicago')
+                       - ((f.collection_timestamp - INTERVAL '1 hour') AT TIME ZONE 'America/Chicago')
+                       = INTERVAL '2 hours'))::bigint AS legacy_fold_snapshots,
                COUNT(*) FILTER (WHERE f.status = 'processed' AND f.row_count = 0)::bigint AS empty_files,
                COUNT(*) FILTER (WHERE f.status <> 'processed')::bigint AS unprocessed_files,
                COUNT(*) FILTER (WHERE f.status = 'processed'
@@ -108,8 +112,8 @@ VALIDATION_HISTORY_QUERY = """
         FROM scoped_files f LEFT JOIN prediction_counts p USING (file_id)
         GROUP BY 1
     )
-    SELECT h.hour_utc,h.snapshot_files,h.empty_files,h.unprocessed_files,
-           h.manifest_mismatches,h.prediction_rows,h.invalid_rows,h.ambiguous_timing_rows,h.delayed_rows,
+    SELECT h.hour_utc,h.snapshot_files,h.legacy_fold_snapshots,h.empty_files,h.unprocessed_files,
+            h.manifest_mismatches,h.prediction_rows,h.invalid_rows,h.ambiguous_timing_rows,h.delayed_rows,
            h.not_delayed_rows,h.unknown_delay_rows,h.missing_gps_rows,h.zero_gps_rows,
            h.scheduled_rows,h.live_rows,h.unknown_schedule_rows,
            h.scheduled_missing_gps_rows,h.live_missing_gps_rows,
@@ -165,6 +169,34 @@ def build_validation_history_frame(rows, window_start, as_of, station_count):
     frame = frame.reindex(hours, fill_value=0)
     full_hours = (frame.index >= window_start) & (frame.index + pd.Timedelta(hours=1) <= as_of)
     frame["Nominal snapshots"] = pd.Series(float(station_count * 12), index=hours).where(full_hours)
+    merged_fold_hours = []
+    local_hours = frame.index.tz_convert("America/Chicago")
+    count_columns = [
+        column for column in VALIDATION_COLUMNS
+        if column not in {"hour_utc", "median_wait", "p90_wait"}
+    ]
+    fold_pairs = []
+    for position in range(len(frame) - 1):
+        first_local = local_hours[position]
+        second_local = local_hours[position + 1]
+        if (first_local.date() != second_local.date()
+                or first_local.hour != 1 or second_local.hour != 1
+                or not full_hours[position] or not full_hours[position + 1]
+                or frame.iloc[position + 1]["legacy_fold_snapshots"] == 0):
+            continue
+        fold_pairs.append((frame.index[position], frame.index[position + 1]))
+
+    drop_hours = []
+    for first_hour, second_hour in fold_pairs:
+        for column in count_columns:
+            frame.at[second_hour, column] += frame.at[first_hour, column]
+        frame.at[second_hour, "Nominal snapshots"] = float(station_count * 24)
+        frame.at[second_hour, "median_wait"] = float("nan")
+        frame.at[second_hour, "p90_wait"] = float("nan")
+        merged_fold_hours.append(second_hour)
+        drop_hours.append(first_hour)
+    if drop_hours:
+        frame = frame.drop(index=drop_hours)
     frame["Coverage (%)"] = 100 * frame["snapshot_files"] / frame["Nominal snapshots"]
     predictions = frame["prediction_rows"].replace(0, float("nan"))
     known_flags = (frame["delayed_rows"] + frame["not_delayed_rows"]).replace(0, float("nan"))
@@ -181,10 +213,13 @@ def build_validation_history_frame(rows, window_start, as_of, station_count):
         100 * frame["unclassified_missing_gps_rows"] / unclassified
     )
     frame["Hour"] = frame.index.tz_convert("America/Chicago").strftime("%Y-%m-%d %H:%M %Z")
+    for hour in merged_fold_hours:
+        frame.at[hour, "Hour"] = f"{hour.tz_convert('America/Chicago'):%Y-%m-%d} 01:00 CDT/CST (legacy combined)"
     frame["Wait median (min)"] = frame["median_wait"]
     frame["Wait p90 (min)"] = frame["p90_wait"]
     return frame.rename(columns={
-        "snapshot_files": "Snapshots", "empty_files": "Empty snapshots",
+        "snapshot_files": "Snapshots", "legacy_fold_snapshots": "Legacy repeated-hour snapshots",
+        "empty_files": "Empty snapshots",
         "prediction_rows": "Predictions", "invalid_rows": "Invalid prediction rows",
         "ambiguous_timing_rows": "Ambiguous timing rows",
         "unprocessed_files": "Unprocessed files", "manifest_mismatches": "Manifest mismatches",
@@ -232,7 +267,7 @@ def aggregate_daily(hourly):
     frame["Day"] = frame["Hour"].str.slice(0, 10)
     frame["full_hour_snapshots"] = frame["Snapshots"].where(frame["Nominal snapshots"].notna())
     counts = [
-        "Snapshots", "Empty snapshots", "Unprocessed files", "Manifest mismatches",
+        "Snapshots", "Legacy repeated-hour snapshots", "Empty snapshots", "Unprocessed files", "Manifest mismatches",
         "Predictions", "Invalid prediction rows", "Ambiguous timing rows", "delayed_rows", "not_delayed_rows",
         "Unknown delay flags", "missing_gps_rows", "zero_gps_rows", "scheduled_rows",
         "live_rows", "unknown_schedule_rows", "scheduled_missing_gps_rows",

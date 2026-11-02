@@ -302,6 +302,8 @@ with overview:
         st.subheader("Collection polling cadence")
         if not hourly.empty:
             line_chart(hourly, ["Snapshots", "Nominal snapshots"], height=300)
+            if hourly["Legacy repeated-hour snapshots"].sum() > 0:
+                st.caption("Legacy snapshots from the repeated 01:00 hour are combined; their split between CDT and CST is unknown.")
         else:
             st.info("No snapshots in this time range.")
     with right:
