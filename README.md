@@ -14,7 +14,7 @@ src/
 	storage/                  Database loader, collection ledger, bucket access, held uploads, recovery
 	monitoring/               Health checks, email alerts and collection gap report
 	utils/                    Logging and staging cleanup
-dashboard/                  Read-only monitoring dashboard
+dashboard/                  Read-only operations monitor and analytics page
 migrations/                 Additive SQL migrations, applied manually
 tests/                      Mocked unit tests
 ```

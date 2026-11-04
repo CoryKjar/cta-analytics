@@ -383,6 +383,39 @@ class ValidationHistoryTests(unittest.TestCase):
         charts = app.get("vega_lite_chart") or app.get("arrow_vega_lite_chart")
         self.assertGreaterEqual(len(charts), 7)
 
+    @patch("dashboard.manifest_history.fetch_dashboard_history")
+    def test_analytics_page_uses_clean_baseline_and_read_only_history(self, fetch):
+        from streamlit.testing.v1 import AppTest
+
+        baseline = pd.Timestamp("2026-11-02T22:30:00Z")
+        as_of = pd.Timestamp.now(tz="UTC")
+        hourly = build_validation_history_frame(
+            [history_row("2026-11-02T23:00Z", snapshot_files=143, prediction_rows=10,
+                         delayed_rows=2, not_delayed_rows=8)],
+            baseline, as_of, len(STATIONS),
+        )
+        fetch.return_value = {
+            "hourly": hourly,
+            "routes": build_route_quality_frame([("Red", 10, 5.0, 12.0, 2, 8, 0)]),
+            "stations": build_station_coverage_frame([], baseline, as_of),
+            "window_start": baseline,
+            "as_of": as_of,
+        }
+
+        with patch.dict("os.environ", {"DATABASE_URL": "unused"}):
+            app = AppTest.from_file(
+                str(Path(__file__).resolve().parents[1] / "dashboard" / "pages" / "Analytics.py")
+            ).run(timeout=30)
+
+        self.assertFalse(app.exception)
+        self.assertTrue(any(item.value == "CTA Analytics" for item in app.title))
+        self.assertTrue(any("Baseline:" in item.value for item in app.caption))
+        charts = app.get("vega_lite_chart") or app.get("arrow_vega_lite_chart")
+        self.assertEqual(len(charts), 2)
+        fetch.assert_called_once()
+        self.assertEqual(fetch.call_args.args[0], None)
+        self.assertEqual(fetch.call_args.kwargs["start"], baseline.to_pydatetime())
+        self.assertGreater(fetch.call_args.kwargs["end"], baseline.to_pydatetime())
 
 if __name__ == "__main__":
     unittest.main()
