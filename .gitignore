@@ -11,3 +11,6 @@ __pycache__/
 # Local staging and logs
 data/
 logs/
+
+# Notebooks
+notebooks/
