@@ -43,6 +43,8 @@ def register_file_results(results):
             item["source_file"],
             item["collection_timestamp"],
             item.get("capture_timestamp"),
+            item.get("file_generated_timestamp"),
+            item.get("file_insert_timestamp"),
             item["station_id"] if item.get("station_id") is not None
             else station_id_from_filename(item["source_file"]),
             item["status"],
@@ -59,12 +61,14 @@ def register_file_results(results):
             cursor.executemany(
                 """
                 INSERT INTO ingestion_files (
-                    source_file, collection_timestamp, capture_timestamp, station_id, status,
+                    source_file, collection_timestamp, capture_timestamp, file_generated_timestamp,
+                    file_insert_timestamp, station_id, status,
                     row_count, attempts, last_error, created_at, updated_at,
                     processed_at
                 )
                 VALUES (
-                    %s, %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s, %s, %s,
+                    %s,
                     CASE WHEN %s = 'failed' THEN 1 ELSE 0 END,
                     %s, NOW(), NOW(),
                     CASE WHEN %s = 'processed' THEN NOW() ELSE NULL END
@@ -73,6 +77,12 @@ def register_file_results(results):
                     collection_timestamp = EXCLUDED.collection_timestamp,
                     capture_timestamp = COALESCE(
                         EXCLUDED.capture_timestamp, ingestion_files.capture_timestamp
+                    ),
+                    file_generated_timestamp = COALESCE(
+                        EXCLUDED.file_generated_timestamp, ingestion_files.file_generated_timestamp
+                    ),
+                    file_insert_timestamp = COALESCE(
+                        EXCLUDED.file_insert_timestamp, ingestion_files.file_insert_timestamp
                     ),
                     station_id = COALESCE(
                         EXCLUDED.station_id, ingestion_files.station_id
@@ -148,6 +158,10 @@ def load_arrivals_data(df):
     df = df.copy()
     if "capture_timestamp" not in df:
         df["capture_timestamp"] = None
+    if "row_generated_timestamp" not in df:
+        df["row_generated_timestamp"] = None
+    if "row_insert_timestamp" not in df:
+        df["row_insert_timestamp"] = None
     for column in ("is_approaching", "is_delayed", "is_scheduled", "is_fault"):
         df[column] = df[column].map(parse_cta_boolean)
     df["run_number"] = df["run_number"].map(parse_cta_run_number)
@@ -182,7 +196,7 @@ def load_arrivals_data(df):
                 destination_map = {name: dest_id for dest_id, name in cursor.fetchall()}
 
             source_files = df[
-                ["source_file", "collection_timestamp", "capture_timestamp", "station_id"]
+                ["source_file", "collection_timestamp", "capture_timestamp", "file_generated_timestamp", "file_insert_timestamp", "station_id"]
             ].drop_duplicates(subset=["source_file"])
             file_records = [
                 (
@@ -190,6 +204,10 @@ def load_arrivals_data(df):
                     pd.Timestamp(row["collection_timestamp"]).to_pydatetime(),
                     pd.Timestamp(row["capture_timestamp"]).to_pydatetime()
                     if pd.notna(row["capture_timestamp"]) else None,
+                    pd.Timestamp(row["file_generated_timestamp"]).to_pydatetime()
+                    if pd.notna(row["file_generated_timestamp"]) else None,
+                    pd.Timestamp(row["file_insert_timestamp"]).to_pydatetime()
+                    if pd.notna(row["file_insert_timestamp"]) else None,
                     int(row["station_id"]),
                 )
                 for _, row in source_files.iterrows()
@@ -198,14 +216,21 @@ def load_arrivals_data(df):
             cursor.executemany(
                 """
                 INSERT INTO ingestion_files (
-                    source_file, collection_timestamp, capture_timestamp, station_id,
+                    source_file, collection_timestamp, capture_timestamp, file_generated_timestamp,
+                    file_insert_timestamp, station_id,
                     status, row_count, attempts, created_at, updated_at
                 )
-                VALUES (%s, %s, %s, %s, 'processing', 0, 0, NOW(), NOW())
+                VALUES (%s, %s, %s, %s, %s, %s, 'processing', 0, 0, NOW(), NOW())
                 ON CONFLICT (source_file) DO UPDATE SET
                     collection_timestamp = EXCLUDED.collection_timestamp,
                     capture_timestamp = COALESCE(
                         EXCLUDED.capture_timestamp, ingestion_files.capture_timestamp
+                    ),
+                    file_generated_timestamp = COALESCE(
+                        EXCLUDED.file_generated_timestamp, ingestion_files.file_generated_timestamp
+                    ),
+                    file_insert_timestamp = COALESCE(
+                        EXCLUDED.file_insert_timestamp, ingestion_files.file_insert_timestamp
                     ),
                     station_id = EXCLUDED.station_id,
                     status = 'processing',
@@ -254,6 +279,10 @@ def load_arrivals_data(df):
                         int(row["heading"]) if pd.notna(row["heading"]) else None,
                         float(row["wait_time"]) if pd.notna(row["wait_time"]) else None,
                         row["run_number"],
+                        pd.Timestamp(row["row_generated_timestamp"]).to_pydatetime()
+                        if pd.notna(row["row_generated_timestamp"]) else None,
+                        pd.Timestamp(row["row_insert_timestamp"]).to_pydatetime()
+                        if pd.notna(row["row_insert_timestamp"]) else None,
                     )
                 )
 
@@ -292,9 +321,10 @@ def load_arrivals_data(df):
                     collection_timestamp, station_id, stop_id, route_id,
                     destination_id, file_id, direction, prediction_time,
                     arrival_time, is_approaching, is_delayed, is_scheduled,
-                    is_fault, latitude, longitude, heading, wait_time, run_number
+                    is_fault, latitude, longitude, heading, wait_time, run_number,
+                    row_generated_timestamp, row_insert_timestamp
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (
                     file_id, stop_id, route_id, arrival_time, run_number
                 ) DO UPDATE SET
@@ -304,7 +334,13 @@ def load_arrivals_data(df):
                     is_fault = EXCLUDED.is_fault,
                     latitude = EXCLUDED.latitude,
                     longitude = EXCLUDED.longitude,
-                    heading = EXCLUDED.heading
+                    heading = EXCLUDED.heading,
+                    row_generated_timestamp = COALESCE(
+                        EXCLUDED.row_generated_timestamp, arrivals.row_generated_timestamp
+                    ),
+                    row_insert_timestamp = COALESCE(
+                        EXCLUDED.row_insert_timestamp, arrivals.row_insert_timestamp
+                    )
                 WHERE arrivals.file_id = EXCLUDED.file_id
                   AND (
                       arrivals.is_approaching IS DISTINCT FROM EXCLUDED.is_approaching

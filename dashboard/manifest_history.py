@@ -18,22 +18,16 @@ VALIDATION_COLUMNS = (
 VALIDATION_HISTORY_QUERY = """
     WITH scoped_files AS (
         SELECT file_id, collection_timestamp, capture_timestamp,
-               COALESCE(capture_timestamp, collection_timestamp AT TIME ZONE 'America/Chicago') AS captured_at,
+               file_generated_timestamp, file_insert_timestamp,
                station_id, status, row_count
         FROM ingestion_files
-        WHERE COALESCE(capture_timestamp, collection_timestamp AT TIME ZONE 'America/Chicago') >= %s
-          AND COALESCE(capture_timestamp, collection_timestamp AT TIME ZONE 'America/Chicago') < %s
+        WHERE file_generated_timestamp >= %s
+          AND file_generated_timestamp < %s
           AND (%s::integer[] IS NULL OR station_id = ANY(%s::integer[]))
     ), prediction_candidates AS (
-        SELECT a.*, f.capture_timestamp AS file_capture_timestamp, f.captured_at,
-               a.prediction_time AT TIME ZONE 'America/Chicago' AS prediction_at_standard,
-               (a.prediction_time AT TIME ZONE 'America/Chicago') - INTERVAL '1 hour' AS prediction_at_daylight,
-               ((a.prediction_time AT TIME ZONE 'America/Chicago')
-                   - ((a.prediction_time - INTERVAL '1 hour') AT TIME ZONE 'America/Chicago')
-                   = INTERVAL '2 hours') AS prediction_is_ambiguous,
-               ((a.collection_timestamp AT TIME ZONE 'America/Chicago')
-                   - ((a.collection_timestamp - INTERVAL '1 hour') AT TIME ZONE 'America/Chicago')
-                   = INTERVAL '2 hours') AS collection_is_ambiguous
+        SELECT a.*, f.capture_timestamp AS file_capture_timestamp, f.file_generated_timestamp,
+               a.row_generated_timestamp,
+               a.row_insert_timestamp
         FROM arrivals a JOIN scoped_files f USING (file_id)
     ), prediction_counts AS (
         SELECT a.file_id, COUNT(*)::bigint AS prediction_rows,
@@ -47,11 +41,7 @@ VALIDATION_HISTORY_QUERY = """
                    OR CASE
                        WHEN a.file_capture_timestamp IS NULL THEN
                            a.prediction_time > a.collection_timestamp
-                           AND NOT (a.prediction_is_ambiguous AND a.collection_is_ambiguous)
-                       WHEN a.prediction_is_ambiguous THEN
-                           a.prediction_at_standard > a.captured_at
-                           AND a.prediction_at_daylight > a.captured_at
-                       ELSE a.prediction_at_standard > a.captured_at
+                       ELSE a.prediction_time > a.file_generated_timestamp
                    END
                    OR ABS(a.wait_time - EXTRACT(EPOCH FROM (a.arrival_time - a.prediction_time)) / 60) > 0.0001
                    OR a.latitude NOT BETWEEN -90 AND 90
@@ -59,8 +49,7 @@ VALIDATION_HISTORY_QUERY = """
                    OR a.heading NOT BETWEEN 0 AND 360
                )::bigint AS invalid_rows,
                COUNT(*) FILTER (WHERE a.file_capture_timestamp IS NULL
-                   AND a.prediction_time > a.collection_timestamp
-                   AND a.prediction_is_ambiguous AND a.collection_is_ambiguous)::bigint
+                   AND a.prediction_time > a.collection_timestamp)::bigint
                    AS ambiguous_timing_rows,
                COUNT(*) FILTER (WHERE a.is_delayed IS TRUE)::bigint AS delayed_rows,
                COUNT(*) FILTER (WHERE a.is_delayed IS FALSE)::bigint AS not_delayed_rows,
@@ -78,19 +67,16 @@ VALIDATION_HISTORY_QUERY = """
                    AND (a.latitude IS NULL OR a.longitude IS NULL))::bigint AS unclassified_missing_gps_rows
         FROM prediction_candidates a GROUP BY a.file_id
     ), hourly_forecast AS (
-        SELECT date_trunc('hour', f.captured_at, 'UTC') AS hour_utc,
+        SELECT date_trunc('hour', f.file_generated_timestamp) AS hour_utc,
                percentile_cont(0.5) WITHIN GROUP (ORDER BY a.wait_time) AS median_wait,
                percentile_cont(0.9) WITHIN GROUP (ORDER BY a.wait_time) AS p90_wait
         FROM arrivals a JOIN scoped_files f USING (file_id)
         WHERE a.wait_time IS NOT NULL
         GROUP BY 1
     ), hourly_files AS (
-        SELECT date_trunc('hour', f.captured_at, 'UTC') AS hour_utc,
+        SELECT date_trunc('hour', f.file_generated_timestamp) AS hour_utc,
                COUNT(*)::bigint AS snapshot_files,
-               COUNT(*) FILTER (WHERE f.capture_timestamp IS NULL
-                   AND ((f.collection_timestamp AT TIME ZONE 'America/Chicago')
-                       - ((f.collection_timestamp - INTERVAL '1 hour') AT TIME ZONE 'America/Chicago')
-                       = INTERVAL '2 hours'))::bigint AS legacy_fold_snapshots,
+               COUNT(*) FILTER (WHERE f.capture_timestamp IS NULL)::bigint AS legacy_fold_snapshots,
                COUNT(*) FILTER (WHERE f.status = 'processed' AND f.row_count = 0)::bigint AS empty_files,
                COUNT(*) FILTER (WHERE f.status <> 'processed')::bigint AS unprocessed_files,
                COUNT(*) FILTER (WHERE f.status = 'processed'
@@ -131,8 +117,8 @@ ROUTE_QUALITY_QUERY = """
            COUNT(*) FILTER (WHERE a.is_delayed IS FALSE)::bigint AS not_delayed_rows,
            COUNT(*) FILTER (WHERE a.is_delayed IS NULL)::bigint AS unknown_delay_rows
         FROM arrivals a JOIN ingestion_files f USING (file_id) JOIN routes r USING (route_id)
-        WHERE COALESCE(f.capture_timestamp, f.collection_timestamp AT TIME ZONE 'America/Chicago') >= %s
-            AND COALESCE(f.capture_timestamp, f.collection_timestamp AT TIME ZONE 'America/Chicago') < %s
+        WHERE f.file_generated_timestamp >= %s
+            AND f.file_generated_timestamp < %s
       AND (%s::integer[] IS NULL OR a.station_id = ANY(%s::integer[]))
     GROUP BY r.route_id,r.route_name ORDER BY predictions DESC
 """
@@ -142,10 +128,10 @@ STATION_COVERAGE_QUERY = """
            COUNT(*) FILTER (WHERE status = 'processed')::bigint AS processed_files,
            COUNT(*) FILTER (WHERE status <> 'processed')::bigint AS unprocessed_files,
            COUNT(*) FILTER (WHERE status = 'processed' AND row_count = 0)::bigint AS empty_files,
-           MAX(collection_timestamp) AS latest_snapshot
+           MAX(file_insert_timestamp) AS latest_snapshot
     FROM ingestion_files
-        WHERE COALESCE(capture_timestamp, collection_timestamp AT TIME ZONE 'America/Chicago') >= %s
-            AND COALESCE(capture_timestamp, collection_timestamp AT TIME ZONE 'America/Chicago') < %s
+        WHERE file_generated_timestamp >= %s
+            AND file_generated_timestamp < %s
       AND station_id IS NOT NULL
       AND (%s::integer[] IS NULL OR station_id = ANY(%s::integer[]))
     GROUP BY station_id
@@ -157,9 +143,10 @@ def build_validation_history_frame(rows, window_start, as_of, station_count):
     frame = pd.DataFrame(rows, columns=VALIDATION_COLUMNS)
     if frame.empty or window_start is None or as_of is None:
         return frame
-    window_start = pd.Timestamp(window_start).tz_convert("UTC")
-    as_of = pd.Timestamp(as_of).tz_convert("UTC")
-    frame["hour_utc"] = pd.to_datetime(frame["hour_utc"], utc=True)
+    # window_start and as_of are already in Chicago time
+    window_start = pd.Timestamp(window_start)
+    as_of = pd.Timestamp(as_of)
+    frame["hour_utc"] = pd.to_datetime(frame["hour_utc"])
     frame = frame.set_index("hour_utc").sort_index()
     last_hour = (as_of - pd.Timedelta(microseconds=1)).floor("h")
     first_hour = window_start.floor("h")
@@ -170,7 +157,7 @@ def build_validation_history_frame(rows, window_start, as_of, station_count):
     full_hours = (frame.index >= window_start) & (frame.index + pd.Timedelta(hours=1) <= as_of)
     frame["Nominal snapshots"] = pd.Series(float(station_count * 12), index=hours).where(full_hours)
     merged_fold_hours = []
-    local_hours = frame.index.tz_convert("America/Chicago")
+    local_hours = frame.index
     count_columns = [
         column for column in VALIDATION_COLUMNS
         if column not in {"hour_utc", "median_wait", "p90_wait"}
@@ -212,9 +199,10 @@ def build_validation_history_frame(rows, window_start, as_of, station_count):
     frame["Unclassified missing GPS (%)"] = (
         100 * frame["unclassified_missing_gps_rows"] / unclassified
     )
-    frame["Hour"] = frame.index.tz_convert("America/Chicago").strftime("%Y-%m-%d %H:%M %Z")
+    # hour_utc is already in Chicago time (despite the name)
+    frame["Hour"] = frame.index.strftime("%Y-%m-%d %H:%M CST")
     for hour in merged_fold_hours:
-        frame.at[hour, "Hour"] = f"{hour.tz_convert('America/Chicago'):%Y-%m-%d} 01:00 CDT/CST (legacy combined)"
+        frame.at[hour, "Hour"] = f"{hour:%Y-%m-%d} 01:00 CST (legacy combined)"
     frame["Wait median (min)"] = frame["median_wait"]
     frame["Wait p90 (min)"] = frame["p90_wait"]
     return frame.rename(columns={
@@ -315,7 +303,7 @@ def fetch_dashboard_history(window_hours=168, *, start=None, end=None, station_i
         conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
         conn.execute("SET LOCAL statement_timeout = '120s'")
         first_snapshot, as_of = conn.execute(
-            "SELECT MIN(collection_timestamp AT TIME ZONE 'America/Chicago'),NOW() FROM ingestion_files"
+            "SELECT MIN(file_generated_timestamp),NOW() FROM ingestion_files"
         ).fetchone()
         station_count = len(station_ids) if station_ids else len(STATIONS)
         if first_snapshot is None:
@@ -323,11 +311,11 @@ def fetch_dashboard_history(window_hours=168, *, start=None, end=None, station_i
             return {"hourly": empty, "routes": build_route_quality_frame([]),
                     "stations": build_station_coverage_frame([], as_of, as_of, station_ids),
                     "window_start": as_of, "as_of": as_of}
-        earliest = pd.Timestamp(first_snapshot).tz_convert("UTC")
+        earliest = pd.Timestamp(first_snapshot)
         if start is not None:
-            window_start = max(earliest, pd.Timestamp(start).tz_convert("UTC"))
+            window_start = max(earliest, pd.Timestamp(start))
             if end is not None:
-                as_of = min(pd.Timestamp(as_of), pd.Timestamp(end).tz_convert("UTC")).to_pydatetime()
+                as_of = min(pd.Timestamp(as_of), pd.Timestamp(end)).to_pydatetime()
         else:
             window_start = max(earliest, pd.Timestamp(as_of) - pd.Timedelta(hours=window_hours)) if window_hours else earliest
         if window_start >= pd.Timestamp(as_of):

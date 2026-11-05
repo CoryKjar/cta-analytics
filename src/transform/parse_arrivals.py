@@ -4,6 +4,7 @@ import re
 from datetime import datetime, timezone
 import pandas as pd
 from pathlib import Path
+import pytz
 
 
 def parse_cta_boolean(value):
@@ -55,8 +56,18 @@ def parse_arrivals_xml(xml_bytes, source_file):
     filename = Path(source_file).stem
     parts = filename.split("_")
 
-    collection_timestamp = pd.to_datetime("_".join(parts[:2]),format="%Y%m%d_%H%M%S")
-    capture_timestamp = capture_timestamp_from_filename(source_file)
+    # Parse collection_timestamp from filename (this is when CTA generated the snapshot, in Chicago time)
+    collection_timestamp = pd.to_datetime("_".join(parts[:2]), format="%Y%m%d_%H%M%S")
+    # Make it Chicago timezone aware
+    chicago_tz = pytz.timezone('America/Chicago')
+    collection_timestamp_chicago = chicago_tz.localize(collection_timestamp)
+    
+    # Parse file_insert_timestamp from filename metadata (when we fetched it)
+    file_insert_timestamp = capture_timestamp_from_filename(source_file)
+    if file_insert_timestamp:
+        file_insert_timestamp_chicago = file_insert_timestamp.astimezone(chicago_tz)
+    else:
+        file_insert_timestamp_chicago = None
 
     for eta in etas:
         station_id = eta.find("staId").text
@@ -109,7 +120,9 @@ def parse_arrivals_xml(xml_bytes, source_file):
             "heading": heading,
             "wait_time": wait_time,
             "source_file": Path(source_file).name,
-            "capture_timestamp": capture_timestamp,
+            "capture_timestamp": file_insert_timestamp,
+            "row_generated_timestamp": collection_timestamp_chicago,
+            "row_insert_timestamp": file_insert_timestamp_chicago,
             "_source_xml_gzip": source_xml,
         })
 
