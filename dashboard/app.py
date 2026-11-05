@@ -85,7 +85,7 @@ def line_chart(frame, columns, *, height=270, percent=False):
                 "legend": {"labelColor": "#cbd8d6", "titleColor": "#a8bcba"},
             },
         },
-        use_container_width=True,
+        width="stretch",
     )
 
 
@@ -126,7 +126,7 @@ def bar_chart(frame, category, columns, *, height=300, horizontal=True):
                 "legend": {"labelColor": "#cbd8d6", "titleColor": "#a8bcba"},
             },
         },
-        use_container_width=True,
+        width="stretch",
     )
 
 
@@ -212,7 +212,7 @@ with st.sidebar:
         if name.replace("_", " ") in station_names
     ))
     route_filter_slot = st.empty()
-    if st.button("Refresh", use_container_width=True):
+    if st.button("Refresh", width="stretch"):
         monitoring_data.clear()
         st.rerun()
     st.caption("Historical quality calculations use a consistent, read-only database snapshot. Station filters apply to coverage, prediction and route views; health issues always show current status for all stations.")
@@ -276,7 +276,7 @@ if health["issues"]:
         unresolved_runs["Started (Chicago)"] = started.dt.tz_convert("America/Chicago").dt.strftime(
             "%Y-%m-%d %H:%M:%S %Z"
         )
-        st.dataframe(unresolved_runs, use_container_width=True, hide_index=True)
+        st.dataframe(unresolved_runs, width="stretch", hide_index=True)
 else:
     st.success("Pipeline checks are clear · all configured stations have a fresh processed snapshot")
 
@@ -318,7 +318,7 @@ with overview:
     if health["nonprocessed_rows"]:
         st.subheader("Files needing attention")
         attention = pd.DataFrame(health["nonprocessed_rows"], columns=["source_file", "status", "attempts", "last_error", "updated_at"])
-        st.dataframe(attention[["source_file", "status", "attempts", "updated_at"]], use_container_width=True, hide_index=True)
+        st.dataframe(attention[["source_file", "status", "attempts", "updated_at"]], width="stretch", hide_index=True)
     else:
         st.caption("No unprocessed or failed manifest files in the current health check.")
 
@@ -334,7 +334,7 @@ with collection:
             line_chart(hourly, ["Empty snapshots", "Unprocessed files"], height=300)
     st.subheader("Station-by-station coverage")
     if not stations.empty:
-        st.dataframe(stations, use_container_width=True, hide_index=True)
+        st.dataframe(stations, width="stretch", hide_index=True)
 
 with forecast:
     st.info("These are CTA-reported forecasts and flags. No observed train-arrival outcome is stored here, so this view describes forecast behavior, not forecast accuracy.")
@@ -357,7 +357,7 @@ with forecast:
     if not routes.empty:
         route_plot = routes.nlargest(10, "Predictions")
         bar_chart(route_plot, "Route", ["Median predicted wait (min)", "P90 predicted wait (min)"], height=360)
-        st.dataframe(routes, use_container_width=True, hide_index=True)
+        st.dataframe(routes, width="stretch", hide_index=True)
 
 with quality_tab:
     if not hourly.empty:
@@ -425,7 +425,7 @@ with quality_tab:
             file_frame["Updated"] = updated.dt.tz_convert("America/Chicago").dt.strftime(
                 "%Y-%m-%d %H:%M:%S %Z"
             )
-            st.dataframe(file_frame, use_container_width=True, hide_index=True)
+            st.dataframe(file_frame, width="stretch", hide_index=True)
         else:
             st.caption(f"No file processing issues recorded {collection_period}.")
         if not health.get("has_collection_ledger", False):
@@ -445,7 +445,7 @@ with quality_tab:
                     run_frame[column] = values.dt.tz_convert("America/Chicago").dt.strftime(
                         "%Y-%m-%d %H:%M:%S %Z"
                     )
-                st.dataframe(run_frame, use_container_width=True, hide_index=True)
+                st.dataframe(run_frame, width="stretch", hide_index=True)
             else:
                 st.caption(f"No collection runs recorded {collection_period}.")
 
@@ -464,7 +464,7 @@ with quality_tab:
                 attempt_frame["Run started"] = run_started.dt.tz_convert("America/Chicago").dt.strftime(
                     "%Y-%m-%d %H:%M:%S %Z"
                 )
-                st.dataframe(attempt_frame, use_container_width=True, hide_index=True)
+                st.dataframe(attempt_frame, width="stretch", hide_index=True)
             else:
                 st.info(
                     f"No collection failures or request retries recorded {collection_period}."

@@ -107,7 +107,7 @@ def trend_chart(frame, columns, *, height=280):
                 "legend": {"labelColor": "#cbd8d6", "titleColor": "#a8bcba"},
             },
         },
-        use_container_width=True,
+        width="stretch",
     )
 
 
@@ -127,7 +127,7 @@ with st.sidebar:
         placeholder="All stations",
     )
     granularity = st.radio("Granularity", ["Hourly", "Daily"], horizontal=True)
-    if st.button("Refresh", use_container_width=True):
+    if st.button("Refresh", width="stretch"):
         load_analytics.clear()
         st.rerun()
 
@@ -197,7 +197,7 @@ with left:
         st.dataframe(
             routes[["Route", "Predictions", "Median predicted wait (min)",
                     "P90 predicted wait (min)", "Reported delayed (%)", "Unknown delay (%)"]],
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
         )
 with right:
@@ -208,6 +208,6 @@ with right:
         st.dataframe(
             stations[["Station", "Snapshots", "Expected snapshots", "Coverage (%)",
                       "Empty snapshots", "Unprocessed files"]],
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
         )
