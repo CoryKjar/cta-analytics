@@ -1,0 +1,7 @@
+boto3==1.43.102
+pandas==3.0.6
+psycopg==3.3.5
+python-dotenv==1.2.3
+pytz==2024.1
+Requests==2.34.2
+streamlit>=1.51,<2

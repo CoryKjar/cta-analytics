@@ -1,0 +1,414 @@
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+import pandas as pd
+
+from dashboard.manifest_history import (
+    ROUTE_QUALITY_QUERY, STATION_COVERAGE_QUERY, VALIDATION_COLUMNS,
+    VALIDATION_HISTORY_QUERY, build_route_quality_frame, build_station_coverage_frame,
+    build_validation_history_frame, fetch_dashboard_history,
+)
+from src.config.stations import STATIONS
+
+
+def history_row(hour, **counts):
+    values = {"hour_utc": pd.Timestamp(hour), **counts}
+    return tuple(values.get(name, 0) for name in VALIDATION_COLUMNS)
+
+
+class ValidationHistoryTests(unittest.TestCase):
+    def test_missing_hours_are_zero_filled_and_partial_hours_excluded(self):
+        rows = [history_row("2026-10-05T17:00Z", snapshot_files=4), history_row("2026-10-05T19:00Z", snapshot_files=6)]
+        frame = build_validation_history_frame(rows, "2026-10-05T17:40Z", "2026-10-05T19:30Z", 1)
+        self.assertEqual(frame["Snapshots"].tolist(), [4, 0, 6])
+        self.assertTrue(pd.isna(frame.loc[0, "Coverage (%)"]))
+        self.assertEqual(frame.loc[1, "Coverage (%)"], 0)
+        self.assertTrue(pd.isna(frame.loc[2, "Coverage (%)"]))
+        self.assertTrue(frame.loc[0, "Hour"].endswith("12:00 CDT"))
+
+    def test_unknown_flags_are_not_counted_as_false(self):
+        rows = [history_row("2026-10-06T05:00Z", snapshot_files=12, prediction_rows=10,
+                            delayed_rows=2, not_delayed_rows=6, unknown_delay_rows=2,
+                            missing_gps_rows=3, zero_gps_rows=1)]
+        frame = build_validation_history_frame(rows, "2026-10-06T05:00Z", "2026-10-06T06:30Z", 1)
+        self.assertEqual(frame.loc[0, "Coverage (%)"], 100)
+        self.assertEqual(frame.loc[0, "Reported delayed (%)"], 25)
+        self.assertEqual(frame.loc[0, "Unknown delay (%)"], 20)
+        self.assertEqual(frame.loc[0, "Missing GPS (%)"], 30)
+        self.assertEqual(frame.loc[0, "Zero GPS (%)"], 10)
+        self.assertTrue(pd.isna(frame.loc[1, "Reported delayed (%)"]))
+
+    def test_missing_gps_rates_are_split_by_prediction_type(self):
+        rows = [history_row(
+            "2026-10-06T05:00Z", snapshot_files=12, prediction_rows=100,
+            scheduled_rows=40, live_rows=50, unknown_schedule_rows=10,
+            scheduled_missing_gps_rows=20, live_missing_gps_rows=5,
+            unclassified_missing_gps_rows=10,
+        )]
+        frame = build_validation_history_frame(
+            rows, "2026-10-06T05:00Z", "2026-10-06T06:00Z", 1,
+        )
+        self.assertEqual(frame.loc[0, "Scheduled missing GPS (%)"], 50)
+        self.assertEqual(frame.loc[0, "Live missing GPS (%)"], 10)
+        self.assertEqual(frame.loc[0, "Unclassified missing GPS (%)"], 100)
+
+    def test_empty_history_and_empty_snapshots_remain_distinct(self):
+        self.assertTrue(build_validation_history_frame([], None, "2026-10-06T06:00Z", 1).empty)
+        rows = [history_row("2026-10-06T05:00Z", snapshot_files=12, empty_files=12)]
+        frame = build_validation_history_frame(rows, "2026-10-06T05:00Z", "2026-10-06T06:00Z", 1)
+        self.assertEqual(frame.loc[0, "Empty snapshots"], 12)
+        self.assertEqual(frame.loc[0, "Coverage (%)"], 100)
+        self.assertTrue(pd.isna(frame.loc[0, "Reported delayed (%)"]))
+
+    def test_fall_back_hours_have_distinct_chicago_labels(self):
+        rows = [history_row("2026-11-01T06:00Z", snapshot_files=12), history_row("2026-11-01T07:00Z", snapshot_files=12)]
+        frame = build_validation_history_frame(rows, "2026-11-01T06:00Z", "2026-11-01T08:00Z", 1)
+        self.assertTrue(frame.loc[0, "Hour"].endswith("01:00 CDT"))
+        self.assertTrue(frame.loc[1, "Hour"].endswith("01:00 CST"))
+
+    def test_fall_back_snapshots_keep_distinct_chicago_hours(self):
+        from dashboard.manifest_history import aggregate_daily
+
+        rows = [
+            history_row("2026-11-01T06:00Z", snapshot_files=12),
+            history_row("2026-11-01T07:00Z", snapshot_files=12),
+        ]
+        hourly = build_validation_history_frame(
+            rows, "2026-11-01T05:00Z", "2026-11-02T06:00Z", 1,
+        )
+        folds = hourly[hourly["Hour"].str.contains("01:00")]
+        self.assertEqual(folds["Hour"].tolist(), [
+            "2026-11-01 01:00 CDT", "2026-11-01 01:00 CST",
+        ])
+        self.assertEqual(folds["Snapshots"].tolist(), [12, 12])
+        self.assertEqual(len(hourly), 25)
+
+        daily = aggregate_daily(hourly)
+        self.assertEqual(daily.loc[0, "Snapshots"], 24)
+        self.assertEqual(daily.loc[0, "Nominal snapshots"], 12 * 25)
+
+    def test_history_queries_use_canonical_file_timestamps(self):
+        self.assertIn("file_generated_timestamp >= %s", VALIDATION_HISTORY_QUERY)
+        self.assertIn("date_trunc('hour', f.file_generated_timestamp AT TIME ZONE 'UTC')", VALIDATION_HISTORY_QUERY)
+        self.assertIn("file_generated_timestamp >= %s", ROUTE_QUALITY_QUERY)
+        self.assertIn("MAX(file_generated_timestamp)", STATION_COVERAGE_QUERY)
+        for query in (VALIDATION_HISTORY_QUERY, ROUTE_QUALITY_QUERY, STATION_COVERAGE_QUERY):
+            self.assertNotIn("capture_timestamp", query)
+            self.assertNotIn("file_insert_timestamp", query)
+
+    def test_fall_back_hours_remain_distinct_across_history(self):
+        rows = [
+            history_row("2025-11-02T06:00Z", snapshot_files=0),
+            history_row("2025-11-02T07:00Z", snapshot_files=10),
+            history_row("2026-11-01T06:00Z", snapshot_files=0),
+            history_row("2026-11-01T07:00Z", snapshot_files=20),
+        ]
+        frame = build_validation_history_frame(
+            rows, "2025-11-02T05:00Z", "2026-11-02T06:00Z", 143,
+        )
+        folds = frame[frame["Hour"].str.startswith((
+            "2025-11-02 01:00", "2026-11-01 01:00",
+        ))]
+        self.assertEqual(folds["Hour"].tolist(), [
+            "2025-11-02 01:00 CDT", "2025-11-02 01:00 CST",
+            "2026-11-01 01:00 CDT", "2026-11-01 01:00 CST",
+        ])
+
+    def test_station_coverage_includes_configured_stations_with_no_files(self):
+        first_id = next(iter(STATIONS.values()))
+        frame = build_station_coverage_frame(
+            [(first_id, 287, 1, 2, pd.Timestamp("2026-10-06 00:00:00"))],
+            "2026-10-05T05:00Z", "2026-10-06T05:00Z",
+        )
+        self.assertEqual(len(frame), len(STATIONS))
+        self.assertAlmostEqual(frame.loc[frame["Station ID"] == first_id, "Coverage (%)"].iloc[0], 287 / 288 * 100)
+        self.assertEqual(frame.iloc[0]["Snapshots"], 0)
+        self.assertEqual(frame.iloc[0]["Coverage (%)"], 0)
+
+    def test_route_delay_rate_excludes_unknown_flag_values(self):
+        frame = build_route_quality_frame([("Red", 10, 8.0, 18.0, 2, 6, 2)])
+        self.assertEqual(frame.loc[0, "Reported delayed (%)"], 25)
+        self.assertEqual(frame.loc[0, "Unknown delay (%)"], 20)
+
+    def test_daily_aggregation_sums_counts_and_recomputes_rates(self):
+        from dashboard.manifest_history import aggregate_daily
+        rows = [
+            history_row("2026-10-06T05:00Z", snapshot_files=12, prediction_rows=10, delayed_rows=1, not_delayed_rows=9, median_wait=5),
+            history_row("2026-10-06T06:00Z", snapshot_files=6, prediction_rows=30, delayed_rows=9, not_delayed_rows=21),
+            history_row("2026-10-07T05:00Z", snapshot_files=12, prediction_rows=0),
+        ]
+        hourly = build_validation_history_frame(rows, "2026-10-06T05:00Z", "2026-10-07T05:30Z", 1)
+        daily = aggregate_daily(hourly)
+        first = daily.iloc[0]
+        self.assertEqual(daily["Hour"].tolist()[:2], ["2026-10-06", "2026-10-07"])
+        self.assertEqual(first["Predictions"], 40)
+        self.assertEqual(first["Reported delayed (%)"], 25)
+        self.assertEqual(first["Nominal snapshots"], 12 * 24)
+        self.assertAlmostEqual(first["Coverage (%)"], 100 * 18 / (12 * 24))
+        self.assertTrue(pd.isna(daily.iloc[-1]["Coverage (%)"]))
+        self.assertTrue(daily["Wait median (min)"].isna().all())
+
+    def test_daily_coverage_expects_25_hours_on_fall_back_day(self):
+        from dashboard.manifest_history import aggregate_daily
+
+        rows = [
+            history_row(hour, snapshot_files=143 * 12)
+            for hour in pd.date_range("2026-11-01T05:00Z", periods=25, freq="h")
+        ]
+        hourly = build_validation_history_frame(
+            rows, "2026-11-01T05:00Z", "2026-11-02T06:00Z", 143,
+        )
+        daily = aggregate_daily(hourly)
+        self.assertEqual(len(daily), 1)
+        self.assertEqual(daily.loc[0, "Nominal snapshots"], 143 * 12 * 25)
+        self.assertEqual(daily.loc[0, "Snapshots"], 143 * 12 * 25)
+        self.assertEqual(daily.loc[0, "Coverage (%)"], 100)
+
+    @patch("dashboard.manifest_history.connect")
+    def test_custom_range_and_station_filter_bound_every_query(self, connect):
+        conn = connect.return_value.__enter__.return_value
+        first = pd.Timestamp("2026-10-05T17:00Z")
+        now = pd.Timestamp("2026-10-27T20:00Z")
+        conn.execute.return_value.fetchone.return_value = (first, now.to_pydatetime())
+        conn.execute.return_value.fetchall.return_value = []
+        start = pd.Timestamp("2026-10-20T05:00Z").to_pydatetime()
+        end = pd.Timestamp("2026-10-22T05:00Z").to_pydatetime()
+        result = fetch_dashboard_history(None, start=start, end=end, station_ids=[41300, 40540])
+        bounded = [call.args[1] for call in conn.execute.call_args_list if len(call.args) > 1]
+        self.assertEqual(len(bounded), 3)
+        for parameters in bounded:
+            self.assertEqual(parameters, (start, end, [40540, 41300], [40540, 41300]))
+        self.assertEqual(set(result["stations"]["Station ID"]), {40540, 41300})
+        with self.assertRaises(ValueError):
+            fetch_dashboard_history(12)
+
+    @patch("dashboard.manifest_history.connect")
+    def test_fetch_uses_read_only_consistent_snapshot(self, connect):
+        conn = connect.return_value.__enter__.return_value
+        conn.execute.return_value.fetchone.return_value = (None, pd.Timestamp("2026-10-06T06:00Z"))
+        conn.execute.return_value.fetchall.return_value = []
+        self.assertTrue(fetch_dashboard_history(None)["hourly"].empty)
+        self.assertEqual(conn.execute.call_args_list[0].args[0], "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+
+    @patch("dashboard.manifest_history.connect")
+    def test_window_and_route_station_panels_share_one_read_only_snapshot(self, connect):
+        conn = connect.return_value.__enter__.return_value
+        first = pd.Timestamp("2026-10-05T05:00Z")
+        as_of = pd.Timestamp("2026-10-12T05:00Z")
+
+        def execute(query, parameters=None):
+            cursor = unittest.mock.MagicMock()
+            if query.startswith("SELECT MIN(file_generated_timestamp"):
+                cursor.fetchone.return_value = (first, as_of)
+            elif query == VALIDATION_HISTORY_QUERY:
+                cursor.fetchall.return_value = []
+            elif query.startswith("\n    SELECT r.route_name"):
+                cursor.fetchall.return_value = [("Red", 20, 10.0, 20.0, 2, 16, 2)]
+            else:
+                cursor.fetchall.return_value = [(next(iter(STATIONS.values())), 1008, 0, 4, first)]
+            return cursor
+
+        from dashboard.manifest_history import VALIDATION_HISTORY_QUERY
+
+        conn.execute.side_effect = execute
+        result = fetch_dashboard_history(168)
+        self.assertEqual(result["window_start"], first)
+        self.assertEqual(len(result["routes"]), 1)
+        self.assertEqual(result["routes"].loc[0, "Reported delayed (%)"], 11.11111111111111)
+        bounded_calls = [call for call in conn.execute.call_args_list if call.args[0] in (VALIDATION_HISTORY_QUERY,)]
+        self.assertEqual(len(bounded_calls), 1)
+        self.assertEqual(bounded_calls[0].args[1], (first.to_pydatetime(), as_of.to_pydatetime(), None, None))
+        self.assertEqual(result["stations"].loc[result["stations"]["Station ID"] == next(iter(STATIONS.values())), "Snapshots"].iloc[0], 1008)
+
+    def test_dashboard_renders_all_validation_charts(self):
+        from streamlit.testing.v1 import AppTest
+
+        frame = build_validation_history_frame(
+            [history_row("2026-10-06T05:00Z", snapshot_files=12, prediction_rows=100, not_delayed_rows=100)],
+            "2026-10-06T05:00Z", "2026-10-06T07:00Z", 1,
+        )
+        health = {
+            "issues": {}, "latest_snapshot": pd.Timestamp.now(tz="UTC"),
+            "age_minutes": 1, "status_counts": {"processed": 12},
+            "recent_updates": 12, "mismatch_count": 0,
+            "nonprocessed_rows": [], "retry_rows": [],
+            "file_issue_logs": [
+                ("broken.xml", "failed", 1, "parse: ParseError", pd.Timestamp("2026-10-06T06:00Z")),
+                ("recovered.xml", "processed", 2, None, pd.Timestamp("2026-10-06T06:00Z")),
+                ("legacy.xml", "failed", 1, "private error with token=secret", pd.Timestamp("2026-10-06T06:00Z")),
+            ],
+            "has_collection_ledger": True,
+            "has_collection_retry_details": True,
+            "recent_collection_runs": [(
+                "run-12345678", pd.Timestamp("2026-10-06T06:00Z"),
+                pd.Timestamp("2026-10-06T06:01Z"), "partial", 143, 142, 1,
+                None, 0, 0,
+            )],
+            "collection_attempt_logs": [(
+                "run-12345678", pd.Timestamp("2026-10-06T06:00Z"),
+                "Wilson", 40540, 143, "failed", "bucket_upload", 1, 200,
+                None, "AccessDenied", 403, "ClientError",
+                "snapshot.xml", "raw/2026/10/06/snapshot.xml", 0.5,
+                503, "HTTPError",
+            )],
+        }
+        with patch.dict("os.environ", {"DATABASE_URL": "unused"}), \
+            patch("src.monitoring.health_check.collect_health", return_value=health) as collect, \
+                patch("dashboard.manifest_history.fetch_dashboard_history", return_value={
+                    "hourly": frame,
+                    "routes": pd.DataFrame({
+                        "Route": ["Red"], "Predictions": [100],
+                        "Median predicted wait (min)": [8.0],
+                        "P90 predicted wait (min)": [15.0],
+                        "Reported delayed": [0], "Reported not delayed": [100],
+                        "Unknown delay flags": [0], "Reported delayed (%)": [0.0],
+                        "Unknown delay (%)": [0.0],
+                    }),
+                    "stations": pd.DataFrame({
+                        "Station": ["Wilson"], "Station ID": [40540],
+                        "Snapshots": [12], "Expected snapshots": [12.0],
+                        "Coverage (%)": [100.0], "Unprocessed files": [0],
+                        "Empty snapshots": [0], "Latest snapshot": [pd.Timestamp.now()],
+                    }),
+                    "window_start": pd.Timestamp("2026-10-06T05:00Z"),
+                    "as_of": pd.Timestamp("2026-10-06T07:00Z"),
+                }):
+            app = AppTest.from_file(str(Path(__file__).resolve().parents[1] / "dashboard" / "app.py")).run(timeout=30)
+            collect.assert_called_with(collection_window_hours=168, log_start=None, log_end=None)
+            file_logs = [item.value for item in app.dataframe if "Failed attempts" in item.value.columns]
+            self.assertEqual(len(file_logs), 1)
+            self.assertEqual(file_logs[0]["Failed attempts"].tolist(), [1, 2, 1])
+            self.assertEqual(file_logs[0]["Last recorded error"].tolist(), [
+                "parse: ParseError", "Recovered; previous error not retained",
+                "Stored error details unavailable in safe format",
+            ])
+            attempt_logs = [item.value for item in app.dataframe if "Request attempts" in item.value.columns]
+            self.assertEqual(attempt_logs[0]["Storage error"].tolist(), ["AccessDenied"])
+            self.assertEqual(attempt_logs[0]["Stage"].tolist(), ["bucket_upload"])
+            self.assertEqual(attempt_logs[0]["Last retry HTTP status"].tolist(), [503])
+            self.assertEqual(attempt_logs[0]["Last retry error type"].tolist(), ["HTTPError"])
+            health["recent_collection_runs"] = []
+            health["collection_attempt_logs"] = []
+            for label, hours, period in (
+                ("30 days", 720, "in the last 30 days"),
+                ("All history", None, "across all history"),
+            ):
+                with self.subTest(window=label):
+                    app.selectbox[0].select(label).run(timeout=30)
+                    self.assertFalse(app.exception)
+                    collect.assert_called_with(collection_window_hours=hours, log_start=None, log_end=None)
+                    self.assertIn(f"No collection runs recorded {period}.", [item.value for item in app.caption])
+                    self.assertIn(
+                        f"No collection failures or request retries recorded {period}.",
+                        [item.value for item in app.info],
+                    )
+                    self.assertFalse(any("below nominal" in item.value for item in app.warning))
+                    self.assertFalse(any("Below nominal" in item.value.columns for item in app.dataframe))
+            health["has_collection_retry_details"] = False
+            app.run(timeout=30)
+            self.assertFalse(app.exception)
+            self.assertIn(
+                "Retry failure details require the collection retry-context migration.",
+                [item.value for item in app.info],
+            )
+            health["has_collection_ledger"] = False
+            app.run(timeout=30)
+            self.assertTrue(any("Failed attempts" in item.value.columns for item in app.dataframe))
+            health["issues"] = {
+                "collection_run_incomplete": "Run 63c07775 has no recorded completion: 72/143 uploaded, 0 failed, 71 pending/in progress.",
+            }
+            health["stale_collection_runs"] = [(
+                "63c07775-e09e-4b2e-96ec-532d81c70c6c", pd.Timestamp("2026-10-20T04:20:37Z"),
+                143, 72, 0, 71,
+            )]
+            app.selectbox[0].select("24 hours").run(timeout=30)
+            self.assertFalse(app.exception)
+            self.assertEqual(len(app.error), 1)
+            self.assertIn("1 monitored issue(s)", app.error[0].value)
+            self.assertIn("72/143 uploaded", app.error[0].value)
+            self.assertIn("71 pending/in progress", app.error[0].value)
+            unresolved = [item.value for item in app.dataframe if "Unfinished" in item.value.columns]
+            self.assertEqual(len(unresolved), 1)
+            self.assertEqual(unresolved[0]["Run ID"].tolist(), ["63c07775-e09e-4b2e-96ec-532d81c70c6c"])
+            self.assertEqual(unresolved[0]["Started (Chicago)"].tolist(), ["2026-10-19 23:20:37 CDT"])
+            self.assertEqual(unresolved[0]["Uploaded"].tolist(), [72])
+            self.assertEqual(unresolved[0]["Unfinished"].tolist(), [71])
+            self.assertFalse(any("Pipeline checks are clear" in item.value for item in app.success))
+            health["stale_collection_runs"] = []
+            for key, detail in (
+                ("partial_collection_run", "Run partial-run ended partial: 72/143 uploaded, 1 failed."),
+                ("station_collection_stale", "Wilson has no fresh processed snapshot."),
+                ("failed_files", "1 file has status failed."),
+            ):
+                with self.subTest(issue=key):
+                    health["issues"] = {key: detail}
+                    app.run(timeout=30)
+                    self.assertFalse(app.exception)
+                    self.assertEqual(len(app.error), 1)
+                    self.assertIn(detail, app.error[0].value)
+                    self.assertFalse(any("Pipeline checks are clear" in item.value for item in app.success))
+            health["issues"] = {}
+            health["stale_collection_runs"] = []
+            app.run(timeout=30)
+            self.assertFalse(app.exception)
+            self.assertEqual(len(app.error), 0)
+            self.assertFalse(any("Unfinished" in item.value.columns for item in app.dataframe))
+            app.radio[0].set_value("Daily").run(timeout=30)
+            self.assertFalse(app.exception)
+            self.assertIn("Daily polling coverage (full hours)", [item.value for item in app.subheader])
+            self.assertTrue(any("switch to Hourly" in item.value for item in app.info))
+            app.multiselect[0].select("Wilson").run(timeout=30)
+            self.assertFalse(app.exception)
+            self.assertTrue(any("1 selected station(s)" in item.value for item in app.caption))
+            app.selectbox[0].select("Custom range").run(timeout=30)
+            self.assertFalse(app.exception)
+            self.assertEqual(len(app.date_input), 1)
+            log_range = collect.call_args.kwargs
+            self.assertIsNone(log_range["collection_window_hours"])
+            self.assertEqual(log_range["log_end"] - log_range["log_start"], pd.Timedelta(days=8))
+        self.assertFalse(app.exception)
+        self.assertEqual(app.selectbox[0].options, ["6 hours", "24 hours", "7 days", "30 days", "All history", "Custom range"])
+        self.assertEqual([item.label for item in app.tabs], ["Overview", "Collection", "Forecast behavior", "Data quality"])
+        self.assertIn("Collection logs", [item.value for item in app.subheader])
+        self.assertGreaterEqual(len(app.get("vega_lite_chart")), 7)
+        self.assertIn("Clear", [item.value for item in app.metric])
+        charts = app.get("vega_lite_chart") or app.get("arrow_vega_lite_chart")
+        self.assertGreaterEqual(len(charts), 7)
+
+    @patch("dashboard.manifest_history.fetch_dashboard_history")
+    def test_analytics_page_uses_clean_baseline_and_read_only_history(self, fetch):
+        from streamlit.testing.v1 import AppTest
+
+        baseline = pd.Timestamp("2026-11-02T22:30:00Z")
+        as_of = pd.Timestamp.now(tz="UTC")
+        hourly = build_validation_history_frame(
+            [history_row("2026-11-02T23:00Z", snapshot_files=143, prediction_rows=10,
+                         delayed_rows=2, not_delayed_rows=8)],
+            baseline, as_of, len(STATIONS),
+        )
+        fetch.return_value = {
+            "hourly": hourly,
+            "routes": build_route_quality_frame([("Red", 10, 5.0, 12.0, 2, 8, 0)]),
+            "stations": build_station_coverage_frame([], baseline, as_of),
+            "window_start": baseline,
+            "as_of": as_of,
+        }
+
+        with patch.dict("os.environ", {"DATABASE_URL": "unused"}):
+            app = AppTest.from_file(
+                str(Path(__file__).resolve().parents[1] / "dashboard" / "pages" / "Analytics.py")
+            ).run(timeout=30)
+
+        self.assertFalse(app.exception)
+        self.assertTrue(any(item.value == "CTA Analytics" for item in app.title))
+        self.assertTrue(any("Baseline:" in item.value for item in app.caption))
+        charts = app.get("vega_lite_chart") or app.get("arrow_vega_lite_chart")
+        self.assertEqual(len(charts), 2)
+        fetch.assert_called_once()
+        self.assertEqual(fetch.call_args.args[0], None)
+        self.assertEqual(fetch.call_args.kwargs["start"], baseline.to_pydatetime())
+        self.assertGreater(fetch.call_args.kwargs["end"], baseline.to_pydatetime())
+
+if __name__ == "__main__":
+    unittest.main()

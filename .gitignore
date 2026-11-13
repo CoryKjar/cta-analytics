@@ -1,0 +1,16 @@
+# Environment variables
+.env
+
+# Python
+__pycache__/
+*.pyc
+
+# Editor
+.vscode/
+
+# Local staging and logs
+data/
+logs/
+
+# Notebooks
+notebooks/
